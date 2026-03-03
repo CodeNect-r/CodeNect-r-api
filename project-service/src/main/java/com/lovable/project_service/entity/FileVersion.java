@@ -10,6 +10,8 @@ import java.util.UUID;
 @Table(name = "file_versions")
 @Getter
 @Setter
+@NoArgsConstructor
+@AllArgsConstructor
 public class FileVersion {
 
     @Id

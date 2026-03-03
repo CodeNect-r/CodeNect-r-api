@@ -1,0 +1,21 @@
+### IDE & System Files ###
+.idea/
+.vscode/
+*.swp
+*.iml
+.DS_Store
+
+### Build Artifacts ###
+**/target/
+**/build/
+*.class
+*.jar
+*.war
+
+### Secrets & Environment ###
+.env
+.env.local
+.env.*.local
+
+### Docker ###
+.docker/
