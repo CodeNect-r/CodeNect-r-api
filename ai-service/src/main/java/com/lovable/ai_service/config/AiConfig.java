@@ -16,19 +16,6 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 public class AiConfig {
 
 
-//    @Bean
-//    @Primary
-//    public OpenAiChatModel openAiChatModel(
-//            OpenAiApi openAiApi,
-//            @Value("${spring.ai.openai.chat.options.model}") String modelName) {
-//
-//        return OpenAiChatModel.builder()
-//                .openAiApi(openAiApi)
-//                .defaultOptions(OpenAiChatOptions.builder()
-//                        .model(modelName)
-//                        .build())
-//                .build();
-//    }
 
     @Bean
     public ChatClient chatClient(ChatClient.Builder builder) {
