@@ -55,3 +55,21 @@ services:
 docker:
   memory-limit: 512m
   cpu-limit: 0.5
+
+
+nginx:
+  dynamic:
+    conf:
+      dir: C:/project/CodeNect-r/CodeNect-r-api/nginx/dynamic/
+
+jwt:
+  secret: ${JWT_SECRET:mysupersecurejwtsecretkeythatismorethan32byteslong}
+
+internal:
+  service:
+    name: preview-service
+  shared:
+    secret: super-internal-secret
+
+
+

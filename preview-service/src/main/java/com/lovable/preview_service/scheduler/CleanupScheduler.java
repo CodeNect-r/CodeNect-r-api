@@ -34,8 +34,8 @@ public class CleanupScheduler {
 
         for (PreviewInstance instance : instances) {
             try {
-                dockerService.stopContainer(instance.getContainerId());
-                dockerService.removeContainer(instance.getContainerId());
+                dockerService.stopContainer(instance.getProjectId(), instance.getContainerId());
+                dockerService.removeContainer(instance.getProjectId(), instance.getContainerId());
 
                 instance.setStatus("STOPPED");
                 instance.setUpdatedAt(LocalDateTime.now());
