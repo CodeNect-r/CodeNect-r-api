@@ -41,10 +41,9 @@ public class BuildService {
     @Value("${services.project-service.base-url}")
     private String projectServiceBaseUrl;
 
-    public Path prepareBuildDirectory(String projectId, String token) throws IOException {
+    public Path prepareBuildDirectory(String projectId) throws IOException {
         List<ProjectFileResponse> files = webClient.get()
-                .uri(projectServiceBaseUrl + "/" + projectId + "/files")
-                .header("Authorization", "Bearer " + token)
+                .uri(projectServiceBaseUrl + "/{id}/files", projectId)
                 .retrieve()
                 .bodyToFlux(ProjectFileResponse.class)
                 .collectList()
@@ -54,7 +53,13 @@ public class BuildService {
             throw new RuntimeException("No files found for project: " + projectId);
         }
 
-        Path tempDir = Files.createTempDirectory("preview-" + projectId);
+        Path tempDir = Path.of("/tmp/previews/" + projectId);
+
+        if (Files.exists(tempDir)) {
+            deleteDirectory(tempDir);
+        }
+
+        Files.createDirectories(tempDir);
         boolean hasDockerfile = false;
 
         for (ProjectFileResponse file : files) {
@@ -86,5 +91,18 @@ public class BuildService {
         }
 
         return tempDir;
+    }
+    private void deleteDirectory(Path path) throws IOException {
+
+        Files.walk(path)
+                .sorted((a, b) -> b.compareTo(a))
+                .forEach(p -> {
+                    try {
+                        Files.delete(p);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
     }
 }

@@ -14,6 +14,13 @@ public class AiResponseListener {
 
     @KafkaListener(topics = "ai.response")
     public void onAiResponse(AiResponseEvent event) throws Exception {
-        orchestrator.startPreview(event.getProjectId(),null);
+        if (!"COMPLETED".equalsIgnoreCase(event.getStatus())) {
+            return;
+        }
+        if(orchestrator.isPreviewRunning(event.getProjectId())){
+            orchestrator.updatePreviewFiles(event.getProjectId());
+        }else{
+            orchestrator.startPreview(event.getProjectId());
+        }
     }
 }
