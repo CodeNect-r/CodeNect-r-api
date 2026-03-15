@@ -39,7 +39,7 @@ public class AiOrchestratorService {
         );
 
         GenerationMode mode =
-                "CREATE_PROJECT".equals(event.getOperationType())
+                "INITIAL_PROJECT".equals(event.getOperationType())
                         ? GenerationMode.INITIAL
                         : GenerationMode.REGENERATE;
 
