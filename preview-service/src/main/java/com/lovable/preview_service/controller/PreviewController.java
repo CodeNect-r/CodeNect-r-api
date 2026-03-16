@@ -1,25 +1,40 @@
 package com.lovable.preview_service.controller;
 
+import com.lovable.preview_service.dto.PreviewStatusResponse;
+import com.lovable.preview_service.entity.PreviewLog;
+import com.lovable.preview_service.service.PreviewLogService;
 import com.lovable.preview_service.service.PreviewOrchestratorService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 
 @RestController
-@RequestMapping("/preview")
+@RequestMapping("/api/previews")
 @RequiredArgsConstructor
 public class PreviewController {
 
-    private final PreviewOrchestratorService orchestrator;
+    private final PreviewOrchestratorService previewOrchestratorService;
+    private final PreviewLogService previewLogService;
 
     @PostMapping("/{projectId}/start")
-    public String start(@PathVariable String projectId,@RequestHeader("Authorization") String authHeader) throws Exception {
-        System.out.println("token:" + authHeader);
-        return orchestrator.startPreview(projectId,authHeader);
+    public PreviewStatusResponse start(@PathVariable String projectId) throws Exception {
+        previewOrchestratorService.startPreview(projectId);
+        return previewOrchestratorService.getPreviewStatus(projectId);
     }
 
-    @DeleteMapping("/{projectId}")
+    @PostMapping("/{projectId}/stop")
     public void stop(@PathVariable String projectId) throws Exception {
-        orchestrator.stopPreview(projectId);
+        previewOrchestratorService.stopPreview(projectId);
+    }
+
+    @GetMapping("/{projectId}")
+    public PreviewStatusResponse status(@PathVariable String projectId) {
+        return previewOrchestratorService.getPreviewStatus(projectId);
+    }
+
+    @GetMapping("/{projectId}/logs")
+    public List<PreviewLog> logs(@PathVariable String projectId) {
+        return previewLogService.latest(projectId);
     }
 }
