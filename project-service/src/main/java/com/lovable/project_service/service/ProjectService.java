@@ -45,7 +45,7 @@ public class ProjectService {
                 .projectId(saved.getId())
                 .userEmail(ownerEmail)
                 .prompt(description)
-                .operationType("CREATE_PROJECT")
+                .operationType(OperationType.INITIAL_PROJECT)
                 .build();
 
         aiRequestProducer.send(event);
@@ -62,21 +62,21 @@ public class ProjectService {
 
     @Transactional
     public void handleAiResponse(AiResponseEvent event) {
+        Project project = projectRepository.findById(event.getProjectId()).orElseThrow();
 
-        Project project = projectRepository.findById(event.getProjectId())
-                .orElseThrow();
+        if (!"COMPLETED".equals(event.getStatus()) || event.getFiles() == null || event.getFiles().isEmpty()) {
+            project.setStatus("FAILED");
+            project.setUpdatedAt(LocalDateTime.now());
+            projectRepository.save(project);
+            return;
+        }
 
         for (GeneratedFile file : event.getFiles()) {
-            fileVersioningService.saveOrUpdateFile(
-                    project.getId(),
-                    file.getPath(),
-                    file.getContent()
-            );
+            fileVersioningService.saveOrUpdateFile(project.getId(), file.getPath(), file.getContent());
         }
 
         project.setStatus("READY");
         project.setUpdatedAt(LocalDateTime.now());
-
         projectRepository.save(project);
     }
 
@@ -135,7 +135,8 @@ public class ProjectService {
     public void modifyProject(
             String projectId,
             String prompt,
-            String userEmail
+            String userEmail,
+            String sessionId
     ) {
 
         Project project = projectRepository
@@ -153,9 +154,39 @@ public class ProjectService {
                 .projectId(projectId)
                 .userEmail(userEmail)
                 .prompt(prompt)
-                .operationType("MODIFY_FILE")
+                .sessionId(sessionId)
+                .operationType(OperationType.MODIFY_PROJECT)
                 .build();
 
         aiRequestProducer.send(event);
     }
+    public List<FileNodeResponse> getFileTree(String projectId) {
+        List<ProjectFile> files = projectFileRepository.findByProjectId(projectId);
+        return FileTreeBuilder.build(files);
+    }
+
+    @Transactional
+    public void retryProjectGeneration(String projectId, String userEmail) {
+        Project project = projectRepository.findById(projectId).orElseThrow();
+
+        if (!project.getOwnerEmail().equals(userEmail)) {
+            throw new RuntimeException("Access denied");
+        }
+
+        project.setStatus("PROCESSING");
+        project.setUpdatedAt(LocalDateTime.now());
+        projectRepository.save(project);
+
+        AiRequestEvent event = AiRequestEvent.builder()
+                .eventId(UUID.randomUUID().toString())
+                .eventVersion("v1")
+                .projectId(projectId)
+                .userEmail(userEmail)
+                .prompt(project.getDescription())
+                .operationType(OperationType.RETRY_PROJECT)
+                .build();
+
+        aiRequestProducer.send(event);
+    }
+
 }

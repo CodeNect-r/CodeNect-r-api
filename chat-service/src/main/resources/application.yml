@@ -1,0 +1,32 @@
+server:
+  port: 8084
+
+spring:
+  application:
+    name: chat-service
+
+  spring:
+    jackson:
+      default-property-inclusion: non_null
+
+  kafka:
+    bootstrap-servers: localhost:9091
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+    consumer:
+      group-id: chat-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+
+
+jwt:
+  secret: ${JWT_SECRET:mysupersecurejwtsecretkeythatismorethan32byteslong}
+
+app:
+  websocket:
+    allowed-origins: "*"

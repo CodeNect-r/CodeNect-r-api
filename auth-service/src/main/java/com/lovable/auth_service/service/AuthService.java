@@ -7,7 +7,6 @@ import com.lovable.auth_service.model.Role;
 import com.lovable.auth_service.model.User;
 import com.lovable.auth_service.repository.UserRepository;
 import com.lovable.auth_service.security.JwtService;
-import io.jsonwebtoken.Jwts;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;

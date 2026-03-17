@@ -5,4 +5,5 @@ import lombok.Data;
 @Data
 public class ModifyProjectRequest {
     private String prompt;
+    private String sessionId;
 }
