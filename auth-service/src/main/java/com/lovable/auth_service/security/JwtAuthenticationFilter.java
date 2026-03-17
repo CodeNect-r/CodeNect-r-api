@@ -1,6 +1,5 @@
 package com.lovable.auth_service.security;
 
-
 import com.lovable.auth_service.repository.UserRepository;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -16,7 +15,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
-import java.util.Collections;
 
 @Component
 @RequiredArgsConstructor
@@ -31,6 +29,21 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                                     FilterChain filterChain)
             throws ServletException, IOException {
 
+        String path = request.getRequestURI();
+
+        // 1️⃣ Skip authentication endpoints
+        if (path.equals("/api/auth/login") ||
+                path.equals("/api/auth/signup") ||
+                path.equals("/api/auth/refresh")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        if (SecurityContextHolder.getContext().getAuthentication() != null) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
         final String authHeader = request.getHeader("Authorization");
 
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
@@ -39,38 +52,51 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
 
         final String token = authHeader.substring(7);
-        final String email = jwtService.extractEmail(token);
 
-        if (email != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+        // 2️⃣ Validate JWT format before parsing
+        if (token == null || token.isBlank() || token.split("\\.").length != 3) {
+            filterChain.doFilter(request, response);
+            return;
+        }
 
-            var userOptional = userRepository.findByEmail(email);
+        try {
 
-            if (userOptional.isPresent()) {
+            final String email = jwtService.extractEmail(token);
 
-                String role = jwtService.extractRole(token);
+            if (email != null && SecurityContextHolder.getContext().getAuthentication() == null) {
 
-                UserDetails userDetails = User
-                        .withUsername(userOptional.get().getEmail())
-                        .password(userOptional.get().getPassword())
-                        .authorities("ROLE_" + role)
-                        .build();
+                var userOptional = userRepository.findByEmail(email);
 
-                UsernamePasswordAuthenticationToken authToken =
-                        new UsernamePasswordAuthenticationToken(
-                                userDetails,
-                                null,
-                                userDetails.getAuthorities()
-                        );
+                if (userOptional.isPresent()) {
 
-                authToken.setDetails(
-                        new WebAuthenticationDetailsSource().buildDetails(request)
-                );
+                    String role = jwtService.extractRole(token);
 
-                SecurityContextHolder.getContext().setAuthentication(authToken);
+                    UserDetails userDetails = User
+                            .withUsername(userOptional.get().getEmail())
+                            .password(userOptional.get().getPassword())
+                            .authorities("ROLE_" + role)
+                            .build();
+
+                    UsernamePasswordAuthenticationToken authToken =
+                            new UsernamePasswordAuthenticationToken(
+                                    userDetails,
+                                    null,
+                                    userDetails.getAuthorities()
+                            );
+
+                    authToken.setDetails(
+                            new WebAuthenticationDetailsSource().buildDetails(request)
+                    );
+
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                }
             }
+
+        } catch (Exception e) {
+            // 3️⃣ Never crash the request
+            // Just ignore invalid token
         }
 
         filterChain.doFilter(request, response);
     }
 }
-

@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS document_embeddings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id VARCHAR(255),
     content TEXT,
-    embedding VECTOR(1536)
+    embedding VECTOR(1024)
 );
 
 CREATE INDEX ON document_embeddings

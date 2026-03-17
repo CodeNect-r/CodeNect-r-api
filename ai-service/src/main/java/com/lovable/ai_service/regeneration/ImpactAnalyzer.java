@@ -23,7 +23,7 @@ public class ImpactAnalyzer {
         List<SimilarDocumentProjection> similar =
                 repository.findTopSimilarByProject(projectId, vector, 5);
 
-        double threshold = 0.75;
+        double threshold = 0.35;
 
         return similar.stream()
                 .filter(doc -> doc.getSimilarity() != null

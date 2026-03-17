@@ -45,6 +45,47 @@ public class AiClientService {
         return parseWithSelfHealing(response);
     }
 
+
+    /**
+     * NEW: Generate one file at a time (for realtime progress)
+     */
+    public GeneratedFile generateSingleFile(
+            String context,
+            String userPrompt,
+            String filePath
+    ) {
+
+        String prompt = """
+        Modify or generate ONLY this file.
+
+        FILE PATH:
+        %s
+
+        USER REQUEST:
+        %s
+
+        CONTEXT:
+        %s
+        """.formatted(filePath, userPrompt, context);
+
+        String response = chatClient.prompt()
+                .system(promptFactory.buildSystemPrompt(GenerationMode.REGENERATE))
+                .user(prompt)
+                .call()
+                .content();
+        System.out.println("response:"+ response);
+
+        try {
+            List<GeneratedFile> parsedFiles = parseWithSelfHealing(response);
+            if (parsedFiles != null && !parsedFiles.isEmpty()) {
+                return parsedFiles.get(0);
+            }
+            throw new RuntimeException("AI returned an empty list for the file.");
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse generated file: " + e.getMessage());
+        }
+    }
+
     /**
      * Production-safe JSON parsing with one repair attempt.
      */

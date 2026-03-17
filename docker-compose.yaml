@@ -105,6 +105,16 @@ services:
       JWT_SECRET: mysupersecurejwtsecretkeythatismorethan32byteslong
     networks:
       - lovable-network
+  nginx:
+   image: nginx:latest
+   container_name: nginx
+   ports:
+    - "80:80"
+   volumes:
+    - ./nginx/preview.conf:/etc/nginx/nginx.conf
+    - ./nginx/dynamic:/etc/nginx/conf.d/dynamic
+
+  
 
 
 volumes:
