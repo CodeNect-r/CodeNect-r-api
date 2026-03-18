@@ -6,6 +6,8 @@ import com.lovable.ai_service.repository.DocumentEmbeddingRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
 
@@ -16,7 +18,7 @@ public class EmbeddingService {
     private final EmbeddingModel embeddingModel;
     private final DocumentEmbeddingRepository embeddingRepository;
 
-    private static final int CHUNK_SIZE = 800; // characters
+    private static final int CHUNK_SIZE = 800;
 
     public float[] generateEmbedding(String text) {
         return embeddingModel
@@ -26,12 +28,16 @@ public class EmbeddingService {
                 .getOutput();
     }
 
+    // 🔥 IMPORTANT: New transaction per thread
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void storeFileEmbeddings(String projectId, GeneratedFile file) {
 
-        // Delete old embeddings for this file
+        // ✅ Safe delete
         embeddingRepository.deleteByProjectIdAndFilePath(projectId, file.getPath());
 
         List<String> chunks = chunkContent(file.getContent());
+
+        List<DocumentEmbedding> batch = new ArrayList<>();
 
         for (int i = 0; i < chunks.size(); i++) {
 
@@ -45,8 +51,11 @@ public class EmbeddingService {
                     .embedding(vector)
                     .build();
 
-            embeddingRepository.save(embedding);
+            batch.add(embedding);
         }
+
+        // 🔥 BATCH INSERT (VERY IMPORTANT)
+        embeddingRepository.saveAll(batch);
     }
 
     private List<String> chunkContent(String content) {
@@ -60,6 +69,7 @@ public class EmbeddingService {
 
         return chunks;
     }
+
     public String getProjectContext(
             String projectId,
             Set<String> impactedFiles
@@ -94,4 +104,5 @@ public class EmbeddingService {
         }
 
         return contextBuilder.toString();
-    }}
+    }
+}

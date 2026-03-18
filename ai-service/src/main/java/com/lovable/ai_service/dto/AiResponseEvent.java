@@ -15,6 +15,6 @@ public class AiResponseEvent {
     private String sessionId;
 
     private List<GeneratedFile> files;
-
+    private String framework;
     private String status;
 }

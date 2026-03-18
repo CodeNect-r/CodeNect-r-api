@@ -33,6 +33,7 @@ public class ProjectService {
                 .description(description)
                 .ownerEmail(ownerEmail)
                 .status("PROCESSING")
+                .framework("unknown")
                 .createdAt(LocalDateTime.now())
                 .updatedAt(LocalDateTime.now())
                 .build();
@@ -45,6 +46,7 @@ public class ProjectService {
                 .projectId(saved.getId())
                 .userEmail(ownerEmail)
                 .prompt(description)
+                .framework("unknown")
                 .operationType(OperationType.INITIAL_PROJECT)
                 .build();
 
@@ -63,6 +65,9 @@ public class ProjectService {
     @Transactional
     public void handleAiResponse(AiResponseEvent event) {
         Project project = projectRepository.findById(event.getProjectId()).orElseThrow();
+        if (event.getFramework() != null) {
+            project.setFramework(event.getFramework());
+        }
 
         if (!"COMPLETED".equals(event.getStatus()) || event.getFiles() == null || event.getFiles().isEmpty()) {
             project.setStatus("FAILED");
@@ -142,7 +147,9 @@ public class ProjectService {
         Project project = projectRepository
                 .findById(projectId)
                 .orElseThrow();
-
+        if ("unknown".equals(project.getFramework())) {
+            throw new RuntimeException("Project is still initializing. Try again.");
+        }
         project.setStatus("PROCESSING");
         project.setUpdatedAt(LocalDateTime.now());
 
@@ -155,6 +162,7 @@ public class ProjectService {
                 .userEmail(userEmail)
                 .prompt(prompt)
                 .sessionId(sessionId)
+                .framework(project.getFramework())
                 .operationType(OperationType.MODIFY_PROJECT)
                 .build();
 
@@ -172,7 +180,9 @@ public class ProjectService {
         if (!project.getOwnerEmail().equals(userEmail)) {
             throw new RuntimeException("Access denied");
         }
-
+        if ("unknown".equals(project.getFramework())) {
+            throw new RuntimeException("Project not ready for retry");
+        }
         project.setStatus("PROCESSING");
         project.setUpdatedAt(LocalDateTime.now());
         projectRepository.save(project);
@@ -183,6 +193,7 @@ public class ProjectService {
                 .projectId(projectId)
                 .userEmail(userEmail)
                 .prompt(project.getDescription())
+                .framework(project.getFramework())
                 .operationType(OperationType.RETRY_PROJECT)
                 .build();
 

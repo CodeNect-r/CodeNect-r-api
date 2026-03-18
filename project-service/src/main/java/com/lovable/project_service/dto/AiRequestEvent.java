@@ -15,6 +15,7 @@ public class AiRequestEvent {
 
     private String userEmail;
     private String prompt;
+    private String framework;
 
     private OperationType operationType; // CREATE_PROJECT | MODIFY_FILE
 }
