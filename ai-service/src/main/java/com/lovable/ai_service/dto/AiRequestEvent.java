@@ -15,5 +15,6 @@ public class AiRequestEvent {
     private String userEmail;
     private String sessionId;
     private String prompt;
+    private String framework;
     private String operationType;
 }

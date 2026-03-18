@@ -29,7 +29,11 @@ public class Project {
     private String ownerEmail;
 
     @Column(nullable = false)
-    private String status; // PROCESSING | READY | FAILED
+    private String framework;
+
+    @Column(nullable = false)
+    private String status;
+    // PROCESSING | READY | FAILED
 
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;

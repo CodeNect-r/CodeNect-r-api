@@ -19,7 +19,8 @@ public class AiResponseProducer {
     public void sendResponse(
             AiRequestEvent event,
             ChatSession session,
-            List<GeneratedFile> files
+            List<GeneratedFile> files,
+            String framework
     ) {
 
         AiResponseEvent response = new AiResponseEvent();
@@ -28,6 +29,7 @@ public class AiResponseProducer {
         response.setSessionId(session.getId().toString());
         response.setFiles(files);
         response.setStatus("COMPLETED");
+        response.setFramework(framework);
 
         kafkaTemplate.send("ai.response", response);
     }

@@ -17,6 +17,7 @@ public class AiResponseConsumer {
 
     @KafkaListener(topics = "ai.response", groupId = "project-service-group")
     public void consume(AiResponseEvent event) {
+
         projectService.handleAiResponse(event);
     }
 }

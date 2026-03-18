@@ -1,9 +1,11 @@
 package com.lovable.preview_service.service;
 
+import com.lovable.preview_service.dto.PreviewReadyEvent;
 import com.lovable.preview_service.dto.PreviewStatusResponse;
 import com.lovable.preview_service.entity.PreviewInstance;
 import com.lovable.preview_service.Repository.PreviewInstanceRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -23,6 +25,8 @@ public class PreviewOrchestratorService {
     private final DockerService dockerService;
     private final BuildService buildService;
     private final NginxService nginxService;
+    private final SimpMessagingTemplate messagingTemplate;
+
 
     @Transactional
     public String startPreview(String projectId) throws Exception {
@@ -73,7 +77,9 @@ public class PreviewOrchestratorService {
 
                 nginxService.createDomainRouting(domain, port);
 
-                return "http://" + domain;
+                String url = "http://" + domain;
+                notifyPreviewReady(projectId, url);
+                return url;
             } catch (Exception e) {
 
                 if (attempt == maxRetries) {
@@ -168,5 +174,14 @@ public class PreviewOrchestratorService {
                         .projectId(projectId)
                         .status("NOT_FOUND")
                         .build());
+    }
+
+    public void notifyPreviewReady(String projectId, String url) {
+        PreviewReadyEvent event = new PreviewReadyEvent(projectId, url);
+
+        messagingTemplate.convertAndSend(
+                "/topic/project/" + projectId + "/preview",
+                event
+        );
     }
 }

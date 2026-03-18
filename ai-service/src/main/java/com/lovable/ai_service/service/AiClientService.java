@@ -1,13 +1,16 @@
 package com.lovable.ai_service.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lovable.ai_service.dto.GeneratedFile;
 import com.lovable.ai_service.dto.GenerationMode;
+import com.lovable.ai_service.dto.ProjectSpec;
 import lombok.RequiredArgsConstructor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -19,123 +22,152 @@ public class AiClientService {
     private final ObjectMapper objectMapper;
     private final PromptFactory promptFactory;
 
-    public List<GeneratedFile> generateFiles(
-            String context,
-            String userPrompt,
-            String projectId,
-            Set<String> impactedFiles,
-            GenerationMode mode
-    ) {
-
-        String systemPrompt = promptFactory.buildSystemPrompt(mode);
-
-        String finalPrompt = promptFactory.buildPrompt(
-                context,
-                userPrompt,
-                impactedFiles,
-                mode
-        );
-
+    public ProjectSpec planProject(String userPrompt) {
         String response = chatClient.prompt()
-                .system(systemPrompt)
-                .user(finalPrompt)
+                .system(promptFactory.buildPlanningSystemPrompt())
+                .user(promptFactory.buildPlanningPrompt(userPrompt))
                 .call()
                 .content();
 
-        return parseWithSelfHealing(response);
+        return parseProjectSpecWithRepair(response);
     }
 
-
-    /**
-     * NEW: Generate one file at a time (for realtime progress)
-     */
     public GeneratedFile generateSingleFile(
             String context,
             String userPrompt,
-            String filePath
+            String filePath,
+            Set<String> impactedFiles,
+            GenerationMode mode,
+            String framework
     ) {
-
-        String prompt = """
-        Modify or generate ONLY this file.
-
-        FILE PATH:
-        %s
-
-        USER REQUEST:
-        %s
-
-        CONTEXT:
-        %s
-        """.formatted(filePath, userPrompt, context);
-
         String response = chatClient.prompt()
-                .system(promptFactory.buildSystemPrompt(GenerationMode.REGENERATE))
-                .user(prompt)
+                .system(promptFactory.buildSingleFileSystemPrompt(mode))
+                .user(promptFactory.buildSingleFilePrompt(
+                        context,
+                        userPrompt,
+                        filePath,
+                        impactedFiles,
+                        mode,
+                        framework
+                ))
                 .call()
                 .content();
-        System.out.println("response:"+ response);
 
+        return parseSingleFileWithRepair(response, filePath);
+    }
+
+    public String summarizeResult(
+            String userPrompt,
+            String framework,
+            List<GeneratedFile> files,
+            GenerationMode mode
+    ) {
         try {
-            List<GeneratedFile> parsedFiles = parseWithSelfHealing(response);
-            if (parsedFiles != null && !parsedFiles.isEmpty()) {
-                return parsedFiles.get(0);
-            }
-            throw new RuntimeException("AI returned an empty list for the file.");
+            return chatClient.prompt()
+                    .system(promptFactory.buildSummarySystemPrompt())
+                    .user(promptFactory.buildSummaryPrompt(userPrompt, framework, files, mode))
+                    .call()
+                    .content();
         } catch (Exception e) {
-            throw new RuntimeException("Failed to parse generated file: " + e.getMessage());
+            return fallbackSummary(framework, files, mode);
         }
     }
 
-    /**
-     * Production-safe JSON parsing with one repair attempt.
-     */
-    private List<GeneratedFile> parseWithSelfHealing(String response) {
-
+    private ProjectSpec parseProjectSpecWithRepair(String response) {
         try {
-            return objectMapper.readValue(
-                    cleanMarkdown(response),
-                    new TypeReference<List<GeneratedFile>>() {}
-            );
+            return objectMapper.readValue(cleanMarkdown(response), ProjectSpec.class);
         } catch (Exception firstFailure) {
-
-            // Attempt JSON repair once
-            String repairPrompt = """
-            The following output is intended to be a JSON array of files but is invalid.
-
-            Fix the JSON and return ONLY valid JSON array.
-            Do NOT include explanations.
-            Do NOT include markdown.
-
-            INVALID OUTPUT:
-            %s
-            """.formatted(response);
-
             String repaired = chatClient.prompt()
                     .system("You are a JSON repair tool. Return only valid JSON.")
-                    .user(repairPrompt)
+                    .user("""
+                    Fix the following invalid JSON into this exact shape:
+                    {
+                      "framework": "react-vite|next|vue-vite|angular",
+                      "files": ["package.json", "src/main.jsx"]
+                    }
+
+                    INVALID OUTPUT:
+                    %s
+                    """.formatted(response))
                     .call()
                     .content();
 
             try {
-                return objectMapper.readValue(
-                        cleanMarkdown(repaired),
-                        new TypeReference<List<GeneratedFile>>() {}
-                );
+                return objectMapper.readValue(cleanMarkdown(repaired), ProjectSpec.class);
             } catch (Exception secondFailure) {
-                throw new RuntimeException(
-                        "AI JSON parsing failed after repair attempt"
-                );
+                throw new RuntimeException("ProjectSpec parsing failed after repair attempt");
             }
         }
     }
 
-    /**
-     * Removes accidental markdown wrappers like ```json ... ```
-     */
+    private GeneratedFile parseSingleFileWithRepair(String response, String expectedFilePath) {
+        try {
+            JsonNode root = objectMapper.readTree(cleanMarkdown(response));
+
+            if (root.isObject()) {
+                return objectMapper.treeToValue(root, GeneratedFile.class);
+            }
+
+            if (root.isArray() && !root.isEmpty()) {
+                return objectMapper.treeToValue(root.get(0), GeneratedFile.class);
+            }
+
+            throw new RuntimeException("AI returned empty file JSON");
+        } catch (Exception firstFailure) {
+            String repaired = chatClient.prompt()
+                    .system("You are a JSON repair tool. Return only valid JSON.")
+                    .user("""
+                    Fix the following invalid JSON into a SINGLE file object.
+                    Return only:
+                    {
+                      "path": "%s",
+                      "content": "..."
+                    }
+
+                    INVALID OUTPUT:
+                    %s
+                    """.formatted(expectedFilePath, response))
+                    .call()
+                    .content();
+
+            try {
+                JsonNode root = objectMapper.readTree(cleanMarkdown(repaired));
+
+                if (root.isObject()) {
+                    return objectMapper.treeToValue(root, GeneratedFile.class);
+                }
+
+                if (root.isArray() && !root.isEmpty()) {
+                    return objectMapper.treeToValue(root.get(0), GeneratedFile.class);
+                }
+
+                throw new RuntimeException("AI returned empty repaired file JSON");
+            } catch (Exception secondFailure) {
+                throw new RuntimeException("Single-file parsing failed after repair attempt");
+            }
+        }
+    }
+
+    private String fallbackSummary(String framework, List<GeneratedFile> files, GenerationMode mode) {
+        List<String> paths = new ArrayList<>();
+        for (GeneratedFile file : files) {
+            paths.add(file.getPath());
+        }
+
+        String action = mode == GenerationMode.INITIAL ? "Built" : "Regenerated";
+        return """
+        %s the requested frontend in %s with:
+        - %d generated files
+        - Core app structure and configuration
+        - Updated code for the requested changes
+
+        Files:
+        - %s
+        """.formatted(action, framework, files.size(), String.join("\n- ", paths));
+    }
+
     private String cleanMarkdown(String input) {
-
         if (input == null) return "";
-
         return input
                 .replace("```json", "")
                 .replace("```", "")
