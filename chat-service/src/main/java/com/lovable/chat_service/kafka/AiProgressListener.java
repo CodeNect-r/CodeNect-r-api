@@ -19,8 +19,8 @@ public class AiProgressListener {
             return;
         }
 
-        // Always forward initial/progress updates on a project-scoped topic
-        String destination = "/topic/project/" + event.getProjectId() + "/generation";
+                // Always forward initial/progress updates on a project-scoped topic
+        String destination ="/topic/project/" + event.getProjectId() + "/session/" + event.getSessionId();
 
         System.out.println("🚀 [WEBSOCKET] Forwarding status '" + event.getStatus() + "' to channel: " + destination);
         messagingTemplate.convertAndSend(destination, event);

@@ -1,173 +1,121 @@
 package com.lovable.preview_service.service;
 
+import com.lovable.preview_service.Kafka.PreviewEventProducer;
+import com.lovable.preview_service.Repository.PreviewInstanceRepository;
 import com.lovable.preview_service.dto.PreviewReadyEvent;
 import com.lovable.preview_service.dto.PreviewStatusResponse;
 import com.lovable.preview_service.entity.PreviewInstance;
-import com.lovable.preview_service.Repository.PreviewInstanceRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.messaging.simp.SimpMessagingTemplate;
-import org.springframework.security.core.context.SecurityContextHolder;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.util.Optional;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class PreviewOrchestratorService {
 
     private final PreviewInstanceRepository repository;
-    private final PortAllocatorService portAllocator;
     private final DockerService dockerService;
     private final BuildService buildService;
     private final NginxService nginxService;
-    private final SimpMessagingTemplate messagingTemplate;
-
+    private final PreviewEventProducer previewEventProducer;
 
     @Transactional
     public String startPreview(String projectId) throws Exception {
+        Optional<PreviewInstance> existingOpt = repository.findWithLockByProjectId(projectId);
 
+        if (existingOpt.isPresent()) {
+            PreviewInstance existing = existingOpt.get();
 
+            if ("RUNNING".equals(existing.getStatus())) {
+                return previewUrl(projectId);
+            }
 
-        Optional<PreviewInstance> existing = repository.findByProjectId(projectId);
-
-        if (existing.isPresent() && "RUNNING".equals(existing.get().getStatus())) {
-            return "http://localhost:" + existing.get().getPort();
+            cleanupExistingInstance(existing);
+            repository.delete(existing);
+            repository.flush();
         }
 
-        int port = portAllocator.allocatePort();
+        String containerName = dockerService.containerName(projectId);
 
         PreviewInstance instance = PreviewInstance.builder()
                 .projectId(projectId)
-                .port(port)
+                .containerName(containerName)
                 .status("BUILDING")
                 .createdAt(LocalDateTime.now())
                 .updatedAt(LocalDateTime.now())
                 .build();
 
-        repository.save(instance);
+        repository.saveAndFlush(instance);
 
-        Path buildDir = buildService.prepareBuildDirectory(projectId);
+        String containerId = null;
 
-        int maxRetries = 2;
+        try {
+            Path buildDir = buildService.prepareBuildDirectory(projectId);
 
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
+            String imageTag = dockerService.buildImage(projectId, buildDir);
+            containerId = dockerService.runContainer(projectId, imageTag);
+            dockerService.waitForHttpHealthy(projectId, containerName);
 
-                String imageTag =
-                        dockerService.buildImage(projectId, buildDir);
+            String domain = projectId + ".localhost";
+            nginxService.createDomainRouting(domain, containerName);
 
-                String containerId =
-                        dockerService.runContainer(projectId,imageTag, port);
+            instance.setImageTag(imageTag);
+            instance.setContainerId(containerId);
+            instance.setStatus("RUNNING");
+            instance.setUpdatedAt(LocalDateTime.now());
 
-                waitForHealthCheck(port);
+            repository.saveAndFlush(instance);
 
-                instance.setImageTag(imageTag);
-                instance.setContainerId(containerId);
-                instance.setStatus("RUNNING");
-                instance.setUpdatedAt(LocalDateTime.now());
+            String url = previewUrl(projectId);
+            previewEventProducer.sendPreviewReady(new PreviewReadyEvent(projectId, url));
 
-                repository.save(instance);
+            return url;
 
-                String domain = projectId + ".localhost";
+        } catch (Exception e) {
+            safeCleanup(projectId, containerId, containerName);
 
-                nginxService.createDomainRouting(domain, port);
+            instance.setStatus("FAILED");
+            instance.setUpdatedAt(LocalDateTime.now());
+            repository.saveAndFlush(instance);
 
-                String url = "http://" + domain;
-                notifyPreviewReady(projectId, url);
-                return url;
-            } catch (Exception e) {
-
-                if (attempt == maxRetries) {
-                    instance.setStatus("FAILED");
-                    repository.save(instance);
-                    throw e;
-                }
-            }
+            throw e;
         }
-
-        throw new RuntimeException("Preview failed");
     }
 
+    @Transactional
     public void stopPreview(String projectId) throws Exception {
+        PreviewInstance instance = repository.findWithLockByProjectId(projectId).orElseThrow();
 
-        PreviewInstance instance =
-                repository.findByProjectId(projectId)
-                        .orElseThrow();
+        try {
+            dockerService.removeContainer(projectId, instance.getContainerId());
+        } finally {
+            nginxService.removeDomainRouting(projectId + ".localhost");
 
-        dockerService.stopContainer(projectId,instance.getContainerId());
-        dockerService.removeContainer(projectId,instance.getContainerId());
-
-        instance.setStatus("STOPPED");
-        instance.setUpdatedAt(LocalDateTime.now());
-
-        repository.save(instance);
-    }
-
-    private void waitForHealthCheck(int port)
-            throws Exception {
-
-        int retries = 10;
-
-        for (int i = 0; i < retries; i++) {
-
-            try {
-                HttpURLConnection connection =
-                        (HttpURLConnection)
-                                new URL("http://localhost:" + port)
-                                        .openConnection();
-
-                connection.setConnectTimeout(2000);
-                connection.setReadTimeout(2000);
-
-                int code = connection.getResponseCode();
-
-                if (code >= 200 && code < 500) {
-                    return;
-                }
-
-            } catch (Exception ignored) {}
-
-            Thread.sleep(2000);
+            instance.setStatus("STOPPED");
+            instance.setUpdatedAt(LocalDateTime.now());
+            repository.saveAndFlush(instance);
         }
-
-        throw new RuntimeException("Container health check failed");
     }
-    public boolean isPreviewRunning(String projectId) {
 
+    public boolean isPreviewRunning(String projectId) {
         return repository.findByProjectId(projectId)
                 .map(p -> "RUNNING".equals(p.getStatus()))
                 .orElse(false);
-
     }
-    @Transactional
-    public void updatePreviewFiles(String projectId) throws Exception {
 
-        PreviewInstance instance =
-                repository.findByProjectId(projectId).orElseThrow();
-
-        Path buildDir = buildService.prepareBuildDirectory(projectId);
-
-        dockerService.copyFilesToContainer(
-                projectId,
-                instance.getContainerId(),
-                buildDir
-        );
-
-        instance.setUpdatedAt(LocalDateTime.now());
-        repository.save(instance);
-    }
+    @Transactional(readOnly = true)
     public PreviewStatusResponse getPreviewStatus(String projectId) {
         return repository.findByProjectId(projectId)
                 .map(instance -> PreviewStatusResponse.builder()
                         .projectId(projectId)
                         .status(instance.getStatus())
-                        .port(instance.getPort())
-                        .url("RUNNING".equals(instance.getStatus()) ? "http://" + projectId + ".localhost" : null)
+                        .url("RUNNING".equals(instance.getStatus()) ? previewUrl(projectId) : null)
                         .updatedAt(instance.getUpdatedAt())
                         .build())
                 .orElse(PreviewStatusResponse.builder()
@@ -176,12 +124,43 @@ public class PreviewOrchestratorService {
                         .build());
     }
 
-    public void notifyPreviewReady(String projectId, String url) {
-        PreviewReadyEvent event = new PreviewReadyEvent(projectId, url);
+    private void cleanupExistingInstance(PreviewInstance instance) {
+        try {
+            if (instance.getContainerId() != null && !instance.getContainerId().isBlank()) {
+                dockerService.removeContainer(instance.getProjectId(), instance.getContainerId());
+            } else if (instance.getContainerName() != null && !instance.getContainerName().isBlank()) {
+                dockerService.removeContainerIfExists(instance.getProjectId(), instance.getContainerName());
+            }
+        } catch (Exception e) {
+            log.warn("Failed cleaning old preview container for projectId={}", instance.getProjectId(), e);
+        }
 
-        messagingTemplate.convertAndSend(
-                "/topic/project/" + projectId + "/preview",
-                event
-        );
+        try {
+            nginxService.removeDomainRouting(instance.getProjectId() + ".localhost");
+        } catch (Exception e) {
+            log.warn("Failed cleaning old nginx routing for projectId={}", instance.getProjectId(), e);
+        }
+    }
+
+    private void safeCleanup(String projectId, String containerId, String containerName) {
+        try {
+            if (containerId != null && !containerId.isBlank()) {
+                dockerService.removeContainer(projectId, containerId);
+            } else {
+                dockerService.removeContainerIfExists(projectId, containerName);
+            }
+        } catch (Exception e) {
+            log.warn("Container cleanup failed for projectId={}", projectId, e);
+        }
+
+        try {
+            nginxService.removeDomainRouting(projectId + ".localhost");
+        } catch (Exception e) {
+            log.warn("Nginx cleanup failed for projectId={}", projectId, e);
+        }
+    }
+
+    private String previewUrl(String projectId) {
+        return "http://" + projectId + ".localhost";
     }
 }

@@ -19,8 +19,7 @@ public class AiTokenConsumer {
         }
 
         messagingTemplate.convertAndSend(
-                "/topic/project/" + event.getProjectId() + "/session/" + event.getSessionId(),
-                event
+                "/topic/project/" + event.getProjectId() + "/generation",event
         );
     }
 }

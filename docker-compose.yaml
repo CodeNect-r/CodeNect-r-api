@@ -113,6 +113,8 @@ services:
    volumes:
     - ./nginx/preview.conf:/etc/nginx/nginx.conf
     - ./nginx/dynamic:/etc/nginx/conf.d/dynamic
+   networks:
+    - lovable-network
 
   
 
