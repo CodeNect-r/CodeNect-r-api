@@ -21,9 +21,9 @@ public class PreviewInstance {
 
     private String containerId;
 
-    private String imageTag;
+    private String containerName;
 
-    private Integer port;
+    private String imageTag;
 
     private String status;
     // BUILDING / RUNNING / STOPPED / FAILED

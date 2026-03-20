@@ -10,7 +10,6 @@ import java.time.LocalDateTime;
 public class PreviewStatusResponse {
     private String projectId;
     private String status;
-    private Integer port;
     private String url;
     private LocalDateTime updatedAt;
 }
