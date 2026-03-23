@@ -27,62 +27,95 @@ public class PreviewOrchestratorService {
 
     @Transactional
     public String startPreview(String projectId) throws Exception {
+
         Optional<PreviewInstance> existingOpt = repository.findWithLockByProjectId(projectId);
 
-        if (existingOpt.isPresent()) {
-            PreviewInstance existing = existingOpt.get();
+        PreviewInstance existing = existingOpt.orElse(null);
+        boolean hasRunningPreview = existing != null && "RUNNING".equals(existing.getStatus());
 
-            if ("RUNNING".equals(existing.getStatus())) {
-                return previewUrl(projectId);
-            }
+        String oldContainerId = null;
+        String oldContainerName = null;
 
-            cleanupExistingInstance(existing);
-            repository.delete(existing);
-            repository.flush();
+
+        if (hasRunningPreview) {
+            log.info("🔁 Existing preview running → SAFE REBUILD mode");
+
+            oldContainerId = existing.getContainerId();
+            oldContainerName = existing.getContainerName();
+
+            // mark rebuilding (DO NOT delete yet)
+            existing.setStatus("REBUILDING");
+            existing.setUpdatedAt(LocalDateTime.now());
+            repository.saveAndFlush(existing);
         }
 
-        String containerName = dockerService.containerName(projectId);
-
-        PreviewInstance instance = PreviewInstance.builder()
-                .projectId(projectId)
-                .containerName(containerName)
-                .status("BUILDING")
-                .createdAt(LocalDateTime.now())
-                .updatedAt(LocalDateTime.now())
-                .build();
-
-        repository.saveAndFlush(instance);
-
-        String containerId = null;
+        String newContainerName = dockerService.containerName(projectId) + "-" + System.currentTimeMillis();
+        String newContainerId = null;
 
         try {
             Path buildDir = buildService.prepareBuildDirectory(projectId);
 
             String imageTag = dockerService.buildImage(projectId, buildDir);
-            containerId = dockerService.runContainer(projectId, imageTag);
-            dockerService.waitForHttpHealthy(projectId, containerName);
+
+            // 🚀 RUN NEW CONTAINER (old still running)
+            newContainerId = dockerService.runContainer(projectId, imageTag,newContainerName);
+
+            dockerService.waitForHttpHealthy(projectId, newContainerName);
 
             String domain = projectId + ".localhost";
-            nginxService.createDomainRouting(domain, containerName);
 
-            instance.setImageTag(imageTag);
-            instance.setContainerId(containerId);
-            instance.setStatus("RUNNING");
-            instance.setUpdatedAt(LocalDateTime.now());
+            // 🔥 SWITCH TRAFFIC to new container
+            nginxService.createDomainRouting(domain, newContainerName);
+
+            // ✅ NOW SAFE TO DELETE OLD
+            if (hasRunningPreview) {
+                try {
+                    dockerService.removeContainer(projectId, oldContainerId);
+                    repository.delete(existing);
+                    repository.flush();
+
+                    log.info("🧹 Old preview removed safely");
+                } catch (Exception e) {
+                    log.warn("⚠️ Failed to cleanup old preview", e);
+                }
+            }
+
+            PreviewInstance instance = PreviewInstance.builder()
+                    .projectId(projectId)
+                    .containerName(newContainerName)
+                    .containerId(newContainerId)
+                    .imageTag(imageTag)
+                    .status("RUNNING")
+                    .createdAt(LocalDateTime.now())
+                    .updatedAt(LocalDateTime.now())
+                    .build();
 
             repository.saveAndFlush(instance);
 
             String url = previewUrl(projectId);
-            previewEventProducer.sendPreviewReady(new PreviewReadyEvent(projectId, url));
+
+            previewEventProducer.sendPreviewReady(
+                    new PreviewReadyEvent(projectId, url)
+            );
+
+            log.info("✅ Preview running at {}", url);
 
             return url;
 
         } catch (Exception e) {
-            safeCleanup(projectId, containerId, containerName);
 
-            instance.setStatus("FAILED");
-            instance.setUpdatedAt(LocalDateTime.now());
-            repository.saveAndFlush(instance);
+            log.error("❌ Build failed → keeping old preview alive", e);
+
+            // cleanup ONLY failed new container
+            safeCleanup(projectId, newContainerId, newContainerName);
+
+            if (hasRunningPreview && existing != null) {
+                existing.setStatus("RUNNING");
+                existing.setUpdatedAt(LocalDateTime.now());
+                repository.saveAndFlush(existing);
+
+                return previewUrl(projectId); // ✅ return OLD preview
+            }
 
             throw e;
         }
@@ -115,7 +148,9 @@ public class PreviewOrchestratorService {
                 .map(instance -> PreviewStatusResponse.builder()
                         .projectId(projectId)
                         .status(instance.getStatus())
-                        .url("RUNNING".equals(instance.getStatus()) ? previewUrl(projectId) : null)
+                        .url(("RUNNING".equals(instance.getStatus()) ||
+                                "REBUILDING".equals(instance.getStatus()))
+                                ? previewUrl(projectId) : null)
                         .updatedAt(instance.getUpdatedAt())
                         .build())
                 .orElse(PreviewStatusResponse.builder()
@@ -124,39 +159,15 @@ public class PreviewOrchestratorService {
                         .build());
     }
 
-    private void cleanupExistingInstance(PreviewInstance instance) {
-        try {
-            if (instance.getContainerId() != null && !instance.getContainerId().isBlank()) {
-                dockerService.removeContainer(instance.getProjectId(), instance.getContainerId());
-            } else if (instance.getContainerName() != null && !instance.getContainerName().isBlank()) {
-                dockerService.removeContainerIfExists(instance.getProjectId(), instance.getContainerName());
-            }
-        } catch (Exception e) {
-            log.warn("Failed cleaning old preview container for projectId={}", instance.getProjectId(), e);
-        }
-
-        try {
-            nginxService.removeDomainRouting(instance.getProjectId() + ".localhost");
-        } catch (Exception e) {
-            log.warn("Failed cleaning old nginx routing for projectId={}", instance.getProjectId(), e);
-        }
-    }
-
     private void safeCleanup(String projectId, String containerId, String containerName) {
         try {
             if (containerId != null && !containerId.isBlank()) {
                 dockerService.removeContainer(projectId, containerId);
-            } else {
+            } else if (containerName != null) {
                 dockerService.removeContainerIfExists(projectId, containerName);
             }
         } catch (Exception e) {
-            log.warn("Container cleanup failed for projectId={}", projectId, e);
-        }
-
-        try {
-            nginxService.removeDomainRouting(projectId + ".localhost");
-        } catch (Exception e) {
-            log.warn("Nginx cleanup failed for projectId={}", projectId, e);
+            log.warn("Cleanup failed for projectId={}", projectId, e);
         }
     }
 

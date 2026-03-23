@@ -2,14 +2,17 @@ package com.lovable.ai_service.service;
 
 import com.lovable.ai_service.dto.*;
 import com.lovable.ai_service.entity.ChatSession;
+import com.lovable.ai_service.event.PreviewTriggerEvent;
 import com.lovable.ai_service.producer.AiProgressProducer;
 import com.lovable.ai_service.producer.AiResponseProducer;
 import com.lovable.ai_service.producer.AiTokenProducer;
 import com.lovable.ai_service.regeneration.RegenerationService;
+import com.lovable.ai_service.validation.BuildAutoFixer;
+import com.lovable.ai_service.validation.BuildValidator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
 
@@ -18,22 +21,28 @@ import java.util.*;
 @Slf4j
 public class AiOrchestratorService {
 
-    private final ChatSessionService     sessionService;
-    private final ChatMessageService     messageService;
-    private final AiClientService        aiClientService;
-    private final AiResponseProducer     responseProducer;
-    private final AiProgressProducer     progressProducer;
-    private final AiTokenProducer        tokenProducer;
-    private final EmbeddingService       embeddingService;
-    private final RegenerationService    regenerationService;
-    private final PromptFactory          promptFactory;
-    private final BuildAutoFixer         buildAutoFixer;
-    private final BuildValidator         buildValidator;
+    private final ChatSessionService  sessionService;
+    private final ChatMessageService  messageService;
+    private final AiClientService     aiClientService;
+    private final AiResponseProducer  responseProducer;
+    private final AiProgressProducer  progressProducer;
+    private final AiTokenProducer     tokenProducer;
+    private final EmbeddingService    embeddingService;
+    private final RegenerationService regenerationService;
+    private final PromptFactory       promptFactory;
+    private final BuildValidator      buildValidator;
+    private final BuildAutoFixer      buildAutoFixer;
+    private final ApplicationEventPublisher publisher;
 
-    @Transactional
+    // NOTE: @Transactional removed from process().
+    // The old @Transactional caused the outer transaction to be marked
+    // rollback-only whenever EmbeddingService threw a PSQLException
+    // (Hibernate 7 + pgvector vector column deserialization).
+    // Spring AI VectorStore manages its own transactions internally,
+    // so no outer @Transactional is needed or safe here.
     public void process(AiRequestEvent event) {
-        ChatSession session   = sessionService.getOrCreate(event);
-        String sessionId      = session.getId().toString();
+        ChatSession session = sessionService.getOrCreate(event);
+        String sessionId    = session.getId().toString();
 
         messageService.saveUserMessage(session.getId(), event.getPrompt());
 
@@ -56,14 +65,12 @@ public class AiOrchestratorService {
                         "Planning project structure...", "PLANNING");
                 sendThinking(event.getProjectId(), sessionId, "📐 Planning project structure...");
 
-                // planProject() now enforces CSS-last order internally (FIX #6)
                 ProjectSpec spec = aiClientService.planProject(event.getPrompt());
                 framework = spec.getFramework();
 
                 List<String> plannedFiles = sanitizePlannedFiles(spec.getFiles());
-                if (plannedFiles.isEmpty()) {
+                if (plannedFiles.isEmpty())
                     throw new IllegalStateException("AI returned no planned files");
-                }
 
                 sendProgress(event.getProjectId(), sessionId, null,
                         "Planned " + plannedFiles.size() + " files for " + framework, "PLANNING");
@@ -73,14 +80,11 @@ public class AiOrchestratorService {
 
                 files = generateInitialProjectInPhases(
                         event.getProjectId(), sessionId,
-                        event.getPrompt(), plannedFiles, framework
-                );
+                        event.getPrompt(), plannedFiles, framework);
 
-                // FIX #3 + #4: validate and auto-fix (including Tailwind wiring)
                 files = validateAndFixBuild(
                         event.getProjectId(), sessionId,
-                        event.getPrompt(), files, plannedFiles, framework
-                );
+                        event.getPrompt(), files, plannedFiles, framework);
 
             } else {
                 framework = resolveFramework(event);
@@ -90,14 +94,13 @@ public class AiOrchestratorService {
                 sendThinking(event.getProjectId(), sessionId, "♻️ Regenerating requested files...");
 
                 files = regenerationService.regenerate(
-                        event.getProjectId(), event.getPrompt(), sessionId, framework
-                );
+                        event.getProjectId(), event.getPrompt(), sessionId, framework);
 
-                // FIX #7: always re-validate CSS after regeneration
+                files = buildValidator.repairAll(files, framework);
+
                 files = revalidateCssAfterRegeneration(
                         event.getProjectId(), sessionId,
-                        event.getPrompt(), files, framework
-                );
+                        event.getPrompt(), files, framework);
             }
 
             sendProgress(event.getProjectId(), sessionId, null, "Syncing preview...", "DONE");
@@ -106,11 +109,10 @@ public class AiOrchestratorService {
 
             String summary = aiClientService.streamSummary(
                     event.getPrompt(), framework, files, mode,
-                    event.getProjectId(), sessionId
-            );
+                    event.getProjectId(), sessionId);
 
             messageService.saveAiMessage(session.getId(), summary);
-            responseProducer.sendResponse(event, session, files, framework);
+            publisher.publishEvent(new PreviewTriggerEvent(event,session,files,framework));
 
         } catch (Exception e) {
             log.error("AI orchestration failed for project {}", event.getProjectId(), e);
@@ -119,7 +121,6 @@ public class AiOrchestratorService {
 
             String failureSummary = "Failed to generate the requested frontend.\nReason:\n- "
                     + safeErrorMessage(e);
-
             tokenProducer.send(AiTokenEvent.builder()
                     .projectId(event.getProjectId()).sessionId(sessionId)
                     .token(failureSummary).completed(false).build());
@@ -132,88 +133,66 @@ public class AiOrchestratorService {
         }
     }
 
-    /* =======================================================
-       🏗 GENERATE INITIAL PROJECT IN PHASES
-       FIX #1 + #2 + #5: CSS file is detected per-file and routed
-       to generateCssFile() instead of generateSingleFile().
-       This means CSS is always built from real JSX content.
-    ======================================================= */
+    // ═════════════════════════════════════════════════════════════
+    //  GENERATE INITIAL PROJECT IN PHASES
+    // ═════════════════════════════════════════════════════════════
 
     private List<GeneratedFile> generateInitialProjectInPhases(
-            String projectId,
-            String sessionId,
-            String userPrompt,
-            List<String> plannedFiles,
-            String framework
+            String projectId, String sessionId,
+            String userPrompt, List<String> plannedFiles, String framework
     ) {
-        // FIX #1: sortFilesForGeneration ensures CSS is last
-        // (already enforced in planProject, but we re-apply here as safety net)
         List<String> orderedFiles = promptFactory.sortFilesForGeneration(plannedFiles);
-
         List<List<String>> phases = buildGenerationPhases(orderedFiles);
         List<GeneratedFile> allFiles = new ArrayList<>();
-
         String cssEntryPath = promptFactory.getCssEntryPath(framework);
 
         for (int i = 0; i < phases.size(); i++) {
             List<String> phase = phases.get(i);
-
-            if (i == 0) {
-                sendThinking(projectId, sessionId, "🧩 Structuring project foundation...");
-            } else if (i == 1) {
-                sendThinking(projectId, sessionId, "🏗 Building core app structure...");
-            } else {
-                sendThinking(projectId, sessionId, "🎨 Building UI pages and components...");
-            }
+            if (i == 0)      sendThinking(projectId, sessionId, "🧩 Structuring project foundation...");
+            else if (i == 1) sendThinking(projectId, sessionId, "🏗 Building core app structure...");
+            else             sendThinking(projectId, sessionId, "🎨 Building UI pages and components...");
             sleepQuietly(150);
 
             for (String filePath : phase) {
                 try {
-                    sendProgress(projectId, sessionId, filePath,
-                            "Generating " + filePath, "GENERATING");
+                    sendProgress(projectId, sessionId, filePath, "Generating " + filePath, "GENERATING");
                     sendThinking(projectId, sessionId, "⚡ Generating " + filePath + "...");
 
                     GeneratedFile file;
 
-                    // FIX #2 + #5: CSS entry file uses audit prompt with raw JSX content
                     if (filePath.equals(cssEntryPath)) {
+                        // CSS audit prompt — only pass JSX files, cap at 10
+                        List<GeneratedFile> jsxFiles = allFiles.stream()
+                                .filter(f -> f.getPath().endsWith(".jsx")
+                                        || f.getPath().endsWith(".tsx")
+                                        || f.getPath().endsWith(".vue"))
+                                .limit(10)
+                                .toList();
+                        long jsxCount = jsxFiles.size();
                         sendThinking(projectId, sessionId,
-                                "🎨 Building Tailwind CSS from " + allFiles.stream()
-                                        .filter(f -> f.getPath().endsWith(".jsx")
-                                                || f.getPath().endsWith(".tsx")
-                                                || f.getPath().endsWith(".vue"))
-                                        .count() + " component files...");
-
-                        file = aiClientService.generateCssFile(
-                                allFiles,    // FIX #5: raw files, not sanitized string
-                                userPrompt,
-                                framework
-                        );
+                                "🎨 Building Tailwind CSS from " + jsxCount + " component files...");
+                        file = aiClientService.generateCssFile(jsxFiles, userPrompt, framework);
                     } else {
-                        // Normal file generation
                         String context = buildGenerationContext(framework, orderedFiles, allFiles);
-
                         file = aiClientService.generateSingleFile(
-                                context,
-                                userPrompt,
-                                filePath,
-                                Set.copyOf(orderedFiles),
-                                GenerationMode.INITIAL,
-                                framework
-                        );
+                                context, userPrompt, filePath,
+                                Set.copyOf(orderedFiles), GenerationMode.INITIAL, framework);
                     }
 
-                    if (file == null || file.getContent() == null || file.getContent().isBlank()) {
+                    if (file == null || file.getContent() == null || file.getContent().isBlank())
                         throw new IllegalStateException("Generated empty file for " + filePath);
-                    }
 
-                    embeddingService.storeFileEmbeddings(projectId, file);
                     allFiles.add(file);
-
-                    sendProgress(projectId, sessionId, filePath,
-                            "Finished " + filePath, "COMPLETED");
+                    sendProgress(projectId, sessionId, filePath, "Finished " + filePath, "COMPLETED");
                     sendThinking(projectId, sessionId, "✅ Finished " + filePath);
                     sleepQuietly(120);
+
+                    // Store embeddings — non-fatal if Ollama OOMs on a chunk
+                    try {
+                        embeddingService.storeFileEmbeddings(projectId, file);
+                    } catch (Exception e) {
+                        log.warn("⚠️ Embedding failed for {} — skipping: {}", filePath, e.getMessage());
+                    }
 
                 } catch (Exception e) {
                     sendProgress(projectId, sessionId, filePath, "Failed " + filePath, "FAILED");
@@ -226,19 +205,14 @@ public class AiOrchestratorService {
         return allFiles;
     }
 
-    /* =======================================================
-       🔍 VALIDATE AND FIX BUILD (FIX #3 + #4)
-       Now handles TAILWIND_WIRING: and CSS_MISSING_CLASS: issues
-       in addition to the original build issues.
-    ======================================================= */
+    // ═════════════════════════════════════════════════════════════
+    //  VALIDATE AND FIX BUILD
+    // ═════════════════════════════════════════════════════════════
 
     private List<GeneratedFile> validateAndFixBuild(
-            String projectId,
-            String sessionId,
-            String userPrompt,
-            List<GeneratedFile> files,
-            List<String> plannedFiles,
-            String framework
+            String projectId, String sessionId,
+            String userPrompt, List<GeneratedFile> files,
+            List<String> plannedFiles, String framework
     ) {
         sendThinking(projectId, sessionId, "🔍 Validating Tailwind setup and build...");
         sleepQuietly(200);
@@ -260,9 +234,7 @@ public class AiOrchestratorService {
         for (String issue : issues) {
             sendThinking(projectId, sessionId, "🛠 Fixing: "
                     + issue.substring(0, Math.min(80, issue.length())));
-
             GeneratedFile fixed = buildAutoFixer.fix(issue, fixedFiles, userPrompt, framework);
-
             if (fixed != null) {
                 fixedFiles.removeIf(f -> f.getPath().equals(fixed.getPath()));
                 fixedFiles.add(fixed);
@@ -270,11 +242,10 @@ public class AiOrchestratorService {
             }
         }
 
-        // Re-validate after fixes
         List<String> remaining = buildValidator.validate(fixedFiles, framework);
         if (!remaining.isEmpty()) {
             log.error("❌ Still failing after auto-fix: {}", remaining);
-            sendThinking(projectId, sessionId, "❌ Some issues could not be auto-fixed: " + remaining);
+            sendThinking(projectId, sessionId, "❌ Unfixed issues: " + remaining);
         } else {
             sendThinking(projectId, sessionId, "🎉 All issues fixed successfully");
         }
@@ -282,35 +253,35 @@ public class AiOrchestratorService {
         return fixedFiles;
     }
 
-    /* =======================================================
-       🔁 RE-VALIDATE CSS AFTER REGENERATION (FIX #7)
-       Any time JSX files are regenerated, the CSS entry file
-       must be re-checked. New Tailwind usage might need the
-       directive verified, or the CSS file might be missing.
-    ======================================================= */
+    // ═════════════════════════════════════════════════════════════
+    //  RE-VALIDATE CSS AFTER REGENERATION
+    // ═════════════════════════════════════════════════════════════
 
     private List<GeneratedFile> revalidateCssAfterRegeneration(
-            String projectId,
-            String sessionId,
-            String userPrompt,
-            List<GeneratedFile> files,
-            String framework
+            String projectId, String sessionId,
+            String userPrompt, List<GeneratedFile> files, String framework
     ) {
         sendThinking(projectId, sessionId, "🔍 Re-validating Tailwind CSS after regeneration...");
 
-        String cssPath   = promptFactory.getCssEntryPath(framework);
-        boolean isV4     = framework.equals("react-vite") || framework.equals("vue-vite");
+        String cssPath = promptFactory.getCssEntryPath(framework);
 
         GeneratedFile cssFile = files.stream()
                 .filter(f -> f.getPath().equals(cssPath))
                 .findFirst().orElse(null);
 
-        // Case 1: CSS file is completely missing
         if (cssFile == null) {
             log.warn("⚠️ CSS entry file missing after regeneration: {}", cssPath);
             sendThinking(projectId, sessionId, "🎨 Rebuilding CSS entry file...");
 
-            GeneratedFile newCss = aiClientService.generateCssFile(files, userPrompt, framework);
+            // Only pass JSX files, cap at 10 — prevents context length errors
+            List<GeneratedFile> jsxFiles = files.stream()
+                    .filter(f -> f.getPath().endsWith(".jsx")
+                            || f.getPath().endsWith(".tsx")
+                            || f.getPath().endsWith(".vue"))
+                    .limit(10)
+                    .toList();
+
+            GeneratedFile newCss = aiClientService.generateCssFile(jsxFiles, userPrompt, framework);
             if (newCss != null) {
                 List<GeneratedFile> updated = new ArrayList<>(files);
                 updated.add(newCss);
@@ -320,40 +291,13 @@ public class AiOrchestratorService {
             return files;
         }
 
-        // Case 2: CSS file exists but directive is wrong/missing
-        String content = cssFile.getContent() == null ? "" : cssFile.getContent().trim();
-        boolean hasDirective = isV4
-                ? (content.contains("@import \"tailwindcss\"") || content.contains("@import 'tailwindcss'"))
-                : (content.contains("@tailwind base")
-                && content.contains("@tailwind components")
-                && content.contains("@tailwind utilities"));
-
-        if (!hasDirective) {
-            log.warn("⚠️ Tailwind directive missing in {} after regeneration", cssPath);
-            sendThinking(projectId, sessionId, "🎨 Fixing Tailwind directive in " + cssPath + "...");
-
-            String directive = isV4
-                    ? "@import \"tailwindcss\";\n\n"
-                    : "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n";
-
-            // Strip any existing broken directives and prepend the correct one
-            String cleaned = content
-                    .replaceAll("@import [\"']tailwindcss[\"'];?\\s*", "")
-                    .replaceAll("@tailwind base;?\\s*", "")
-                    .replaceAll("@tailwind components;?\\s*", "")
-                    .replaceAll("@tailwind utilities;?\\s*", "")
-                    .trim();
-
-            GeneratedFile fixedCss = GeneratedFile.builder()
-                    .path(cssPath)
-                    .content(directive + cleaned)
-                    .build();
-
+        GeneratedFile repairedCss = buildValidator.repairFile(cssFile, framework);
+        if (!repairedCss.getContent().equals(cssFile.getContent())) {
+            log.info("⚠️ CSS entry file repaired after regeneration: {}", cssPath);
+            sendThinking(projectId, sessionId, "✅ Tailwind directive fixed in " + cssPath);
             List<GeneratedFile> updated = new ArrayList<>(files);
             updated.removeIf(f -> f.getPath().equals(cssPath));
-            updated.add(fixedCss);
-
-            sendThinking(projectId, sessionId, "✅ Tailwind directive fixed in " + cssPath);
+            updated.add(repairedCss);
             return updated;
         }
 
@@ -361,25 +305,20 @@ public class AiOrchestratorService {
         return files;
     }
 
-    /* =======================================================
-       🔧 PHASE BUILDER
-       Updated to put CSS files in phase 3 (last) as safety net.
-    ======================================================= */
+    // ═════════════════════════════════════════════════════════════
+    //  PHASE BUILDER
+    // ═════════════════════════════════════════════════════════════
 
     private List<List<String>> buildGenerationPhases(List<String> files) {
-        List<String> phase1 = new ArrayList<>(); // config/boilerplate
-        List<String> phase2 = new ArrayList<>(); // app shell
-        List<String> phase3 = new ArrayList<>(); // pages/components
-        List<String> phase4 = new ArrayList<>(); // CSS always last (FIX #6)
+        List<String> phase1 = new ArrayList<>();
+        List<String> phase2 = new ArrayList<>();
+        List<String> phase3 = new ArrayList<>();
+        List<String> phase4 = new ArrayList<>();
 
         for (String file : files) {
             String n = file.toLowerCase(Locale.ROOT);
-
-            // CSS entry files always go last
             if (n.endsWith(".css") || n.endsWith(".scss")) {
                 phase4.add(file);
-
-                // Config / boilerplate
             } else if (n.equals("package.json")
                     || n.equals("vite.config.js") || n.equals("vite.config.ts")
                     || n.equals("index.html")
@@ -387,16 +326,12 @@ public class AiOrchestratorService {
                     || n.equals("angular.json") || n.equals("tsconfig.json")
                     || n.equals("tailwind.config.js") || n.equals("postcss.config.js")) {
                 phase1.add(file);
-
-                // App shell
             } else if (n.contains("main.")
                     || n.endsWith("/layout.js") || n.endsWith("/layout.tsx")
                     || n.endsWith("/page.js")   || n.endsWith("/page.tsx")
                     || n.endsWith("/app.jsx")   || n.endsWith("/app.tsx")
                     || n.endsWith("/app.vue")) {
                 phase2.add(file);
-
-                // Everything else
             } else {
                 phase3.add(file);
             }
@@ -406,41 +341,49 @@ public class AiOrchestratorService {
         if (!phase1.isEmpty()) phases.add(phase1);
         if (!phase2.isEmpty()) phases.add(phase2);
         if (!phase3.isEmpty()) phases.add(phase3);
-        if (!phase4.isEmpty()) phases.add(phase4); // CSS always in its own final phase
+        if (!phase4.isEmpty()) phases.add(phase4);
         return phases;
     }
 
-    /* =======================================================
-       HELPERS (unchanged from original)
-    ======================================================= */
+    // ═════════════════════════════════════════════════════════════
+    //  HELPERS
+    // ═════════════════════════════════════════════════════════════
 
     private List<String> sanitizePlannedFiles(List<String> files) {
         if (files == null) return List.of();
-        LinkedHashSet<String> orderedUnique = new LinkedHashSet<>();
-        for (String file : files) {
-            if (file != null && !file.isBlank()) orderedUnique.add(file.trim());
-        }
-        return new ArrayList<>(orderedUnique);
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        for (String f : files) if (f != null && !f.isBlank()) seen.add(f.trim());
+        return new ArrayList<>(seen);
     }
 
     private String buildGenerationContext(
-            String framework,
-            List<String> plannedFiles,
-            List<GeneratedFile> generatedFiles
+            String framework, List<String> plannedFiles, List<GeneratedFile> generatedFiles
     ) {
         StringBuilder sb = new StringBuilder();
         sb.append("FRAMEWORK: ").append(framework).append("\n");
         sb.append("PLANNED FILES:\n");
-        for (String file : plannedFiles) sb.append("- ").append(file).append("\n");
+        for (String f : plannedFiles) sb.append("- ").append(f).append("\n");
         sb.append("\nGENERATED FILES SO FAR:\n");
+
         if (generatedFiles.isEmpty()) {
             sb.append("(none)\n");
-        } else {
-            for (GeneratedFile file : generatedFiles) {
-                sb.append("FILE: ").append(file.getPath()).append("\n")
-                        .append(file.getContent()).append("\n-----\n");
-            }
+            return sb.toString();
         }
+
+        // Cap: 8 files max, 15 lines each — prevents context length errors
+        int fileLimit = Math.min(generatedFiles.size(), 8);
+        for (int i = 0; i < fileLimit; i++) {
+            GeneratedFile f = generatedFiles.get(i);
+            sb.append("FILE: ").append(f.getPath()).append("\n");
+            String[] lines = f.getContent().split("\n");
+            int lineLimit = Math.min(lines.length, 15);
+            for (int j = 0; j < lineLimit; j++) sb.append(lines[j]).append("\n");
+            if (lines.length > 15) sb.append("// ... truncated\n");
+            sb.append("-----\n");
+        }
+        if (generatedFiles.size() > 8)
+            sb.append("// ... and ").append(generatedFiles.size() - 8).append(" more files omitted\n");
+
         return sb.toString();
     }
 
@@ -463,9 +406,8 @@ public class AiOrchestratorService {
     }
 
     private String resolveFramework(AiRequestEvent event) {
-        if (event.getFramework() != null && !event.getFramework().isBlank()) {
+        if (event.getFramework() != null && !event.getFramework().isBlank())
             return event.getFramework();
-        }
         return promptFactory.detectFramework(event.getPrompt());
     }
 

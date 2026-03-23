@@ -7,6 +7,7 @@ import com.lovable.ai_service.dto.GeneratedFile;
 import com.lovable.ai_service.dto.GenerationMode;
 import com.lovable.ai_service.dto.ProjectSpec;
 import com.lovable.ai_service.producer.AiTokenProducer;
+import com.lovable.ai_service.validation.BuildValidator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -21,10 +22,11 @@ import java.util.Set;
 @Slf4j
 public class AiClientService {
 
-    private final ChatClient chatClient;
-    private final ObjectMapper objectMapper;
-    private final PromptFactory promptFactory;
+    private final ChatClient      chatClient;
+    private final ObjectMapper    objectMapper;
+    private final PromptFactory   promptFactory;
     private final AiTokenProducer tokenProducer;
+    private final BuildValidator buildValidator;   // ← injected for per-file repair
 
     private static final int MAX_RETRIES = 3;
 
@@ -48,14 +50,12 @@ public class AiClientService {
 
         ProjectSpec spec = retryParseProjectSpec(response);
 
-        // enforce framework
         if (!framework.equals(spec.getFramework())) {
             log.warn("⚠️ Framework mismatch. Forcing: {}", framework);
             spec.setFramework(framework);
         }
 
-        // FIX #6: enforce CSS-last order immediately after planning
-        // so the generation loop never accidentally generates CSS before JSX
+        // Enforce CSS-last order immediately after planning (FIX #6)
         List<String> orderedFiles = promptFactory.sortFilesForGeneration(spec.getFiles());
         spec.setFiles(orderedFiles);
         log.info("📋 File order enforced (CSS last): {}", orderedFiles);
@@ -64,7 +64,9 @@ public class AiClientService {
     }
 
     /* =======================================================
-       📄 GENERATE SINGLE FILE (normal files)
+       📄 GENERATE SINGLE FILE
+       Runs BuildValidator.repairFile() on every generated file
+       before returning it — catches syntax errors before storage.
     ======================================================= */
 
     public GeneratedFile generateSingleFile(
@@ -75,20 +77,13 @@ public class AiClientService {
             GenerationMode mode,
             String framework
     ) {
-
         log.info("⚡ Generating file: {}", filePath);
 
         String response = safeContent(
                 chatClient.prompt()
                         .system(promptFactory.buildSingleFileSystemPrompt(mode))
                         .user(promptFactory.buildSingleFilePrompt(
-                                context,
-                                userPrompt,
-                                filePath,
-                                impactedFiles,
-                                mode,
-                                framework
-                        ))
+                                context, userPrompt, filePath, impactedFiles, mode, framework))
                         .call()
                         .content()
         );
@@ -98,36 +93,46 @@ public class AiClientService {
         GeneratedFile file = retryParseSingleFile(response, filePath);
 
         if (!filePath.equals(file.getPath())) {
-            log.warn("⚠️ Fixing incorrect file path from AI: {}", file.getPath());
+            log.warn("⚠️ Fixing incorrect file path from AI: {} → {}", file.getPath(), filePath);
             file.setPath(filePath);
         }
+
+        // ── Pass 1: per-file auto-repair ─────────────────────────
+        // Runs deterministic fixes (missing export, @apply custom class,
+        // CSS import order, markdown fences, etc.) before storage.
+        file = buildValidator.repairFile(file, framework);
 
         return file;
     }
 
+    public GeneratedFile generateSingleFileWithPrompt(
+           String fullPrompt, String filePath, String framework) {
+        log.info("⚡ Generating file with custom prompt: {}", filePath);
+        String response = safeContent(chatClient.prompt()
+                               .system(promptFactory.buildSingleFileSystemPrompt(GenerationMode.REGENERATE))
+                               .user(fullPrompt).call().content());
+        GeneratedFile file = retryParseSingleFile(response, filePath);
+         if (!filePath.equals(file.getPath())) file.setPath(filePath);
+        return buildValidator.repairFile(file, framework);
+    }
+
     /* =======================================================
        🎨 GENERATE CSS FILE (FIX #2 + #5)
-       Called instead of generateSingleFile() when the current
-       file is the CSS entry file (src/index.css, app/globals.css,
-       src/style.css, src/styles.css).
        Uses the CSS audit prompt built from already-generated JSX
-       so the AI sees the real class names / Tailwind usage.
+       so the AI sees the real Tailwind class usage.
+       Also runs repairFile() after generation.
     ======================================================= */
 
     public GeneratedFile generateCssFile(
-            List<GeneratedFile> alreadyGeneratedFiles,   // FIX #5: raw, not sanitized
+            List<GeneratedFile> alreadyGeneratedFiles,
             String userPrompt,
             String framework
     ) {
         String cssPath = promptFactory.getCssEntryPath(framework);
         log.info("🎨 Generating CSS entry file with audit prompt: {}", cssPath);
 
-        // FIX #2: use the audit prompt that scans actual JSX content
         String cssAuditPrompt = promptFactory.buildCssAuditPrompt(
-                alreadyGeneratedFiles,  // FIX #5: passed raw — no sanitize() applied
-                framework,
-                userPrompt
-        );
+                alreadyGeneratedFiles, framework, userPrompt);
 
         String response = safeContent(
                 chatClient.prompt()
@@ -141,17 +146,21 @@ public class AiClientService {
 
         GeneratedFile file = retryParseSingleFile(response, cssPath);
 
-        // Always enforce correct CSS path
         if (!cssPath.equals(file.getPath())) {
-            log.warn("⚠️ Fixing incorrect CSS path from AI: {} → {}", file.getPath(), cssPath);
+            log.warn("⚠️ Fixing incorrect CSS path: {} → {}", file.getPath(), cssPath);
             file.setPath(cssPath);
         }
+
+        // ── Pass 1: per-file auto-repair ─────────────────────────
+        // Specifically catches: missing @import "tailwindcss", wrong v3
+        // directives, @apply custom class names, CSS @import order.
+        file = buildValidator.repairFile(file, framework);
 
         return file;
     }
 
     /* =======================================================
-       📊 SUMMARY
+       📊 SUMMARY (streaming)
     ======================================================= */
 
     public String streamSummary(
@@ -172,21 +181,15 @@ public class AiClientService {
                 .content()
                 .doOnNext(token -> {
                     tokenProducer.send(AiTokenEvent.builder()
-                            .projectId(projectId)
-                            .sessionId(sessionId)
-                            .token(token)
-                            .completed(false)
-                            .build());
+                            .projectId(projectId).sessionId(sessionId)
+                            .token(token).completed(false).build());
+                    fullResponse.append(token);
                 })
-                .doOnComplete(() -> {
-                    tokenProducer.send(AiTokenEvent.builder()
-                            .projectId(projectId)
-                            .sessionId(sessionId)
-                            .token("")
-                            .completed(true)
-                            .build());
-                })
+                .doOnComplete(() -> tokenProducer.send(AiTokenEvent.builder()
+                        .projectId(projectId).sessionId(sessionId)
+                        .token("").completed(true).build()))
                 .blockLast();
+
         return fullResponse.toString();
     }
 
@@ -212,18 +215,16 @@ public class AiClientService {
         for (int i = 0; i < MAX_RETRIES; i++) {
             try {
                 JsonNode root = objectMapper.readTree(cleanMarkdown(current));
-                if (root.isObject()) {
+                if (root.isObject())
                     return objectMapper.treeToValue(root, GeneratedFile.class);
-                }
-                if (root.isArray() && !root.isEmpty()) {
+                if (root.isArray() && !root.isEmpty())
                     return objectMapper.treeToValue(root.get(0), GeneratedFile.class);
-                }
             } catch (Exception e) {
                 log.warn("⚠️ File parse failed. Attempt {}", i + 1);
             }
             current = repairJson(current, expectedFilePath);
         }
-        throw new RuntimeException("❌ Single-file parsing failed after retries");
+        throw new RuntimeException("❌ Single-file parsing failed after retries for: " + expectedFilePath);
     }
 
     /* =======================================================
@@ -231,48 +232,29 @@ public class AiClientService {
     ======================================================= */
 
     private String repairJson(String invalidJson, String context) {
-        log.info("🛠 Repairing JSON...");
+        log.info("🛠 Repairing JSON for: {}", context);
         return safeContent(
                 chatClient.prompt()
                         .system("You are a strict JSON repair tool. Return ONLY valid JSON.")
-                        .user("""
-                        Fix this invalid JSON.
-                        CONTEXT: %s
-                        INVALID JSON: %s
-                        """.formatted(context, invalidJson))
+                        .user("Fix this invalid JSON.\nCONTEXT: %s\nINVALID JSON: %s"
+                                .formatted(context, invalidJson))
                         .call()
                         .content()
         );
     }
 
     /* =======================================================
-       🛡 SAFETY
+       🛡 SAFETY HELPERS
     ======================================================= */
 
     private String safeContent(String content) {
-        if (content == null || content.trim().isEmpty()) {
+        if (content == null || content.trim().isEmpty())
             throw new RuntimeException("❌ AI returned empty response");
-        }
         return content;
     }
 
     private String cleanMarkdown(String input) {
         if (input == null) return "";
         return input.replace("```json", "").replace("```", "").trim();
-    }
-
-    /* =======================================================
-       📦 FALLBACK SUMMARY
-    ======================================================= */
-
-    private String fallbackSummary(String framework, List<GeneratedFile> files, GenerationMode mode) {
-        List<String> paths = new ArrayList<>();
-        for (GeneratedFile file : files) paths.add(file.getPath());
-        String action = mode == GenerationMode.INITIAL ? "Built" : "Regenerated";
-        return """
-                %s the requested frontend in %s with:
-                - %d generated files
-                Files:\n- %s
-                """.formatted(action, framework, files.size(), String.join("\n- ", paths));
     }
 }

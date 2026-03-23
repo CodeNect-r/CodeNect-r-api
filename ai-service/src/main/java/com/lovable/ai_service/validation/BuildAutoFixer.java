@@ -1,9 +1,9 @@
-package com.lovable.ai_service.service;
+package com.lovable.ai_service.validation;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.lovable.ai_service.dto.GeneratedFile;
+import com.lovable.ai_service.service.PromptFactory;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;

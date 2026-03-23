@@ -71,10 +71,9 @@ public class DockerService {
         return tag;
     }
 
-    public String runContainer(String projectId, String imageTag) throws Exception {
+    public String runContainer(String projectId, String imageTag,String containerName) throws Exception {
         ensureNetworkExists();
 
-        String containerName = containerName(projectId);
         removeContainerIfExists(projectId, containerName);
 
         ProcessBuilder pb = new ProcessBuilder(
