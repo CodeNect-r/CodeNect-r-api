@@ -10,6 +10,8 @@ import org.springframework.web.reactive.function.client.WebClient;
 
 import java.time.Instant;
 
+import static reactor.netty.http.HttpConnectionLiveness.log;
+
 @Configuration
 @RequiredArgsConstructor
 public class WebClientConfig {
@@ -21,7 +23,7 @@ public class WebClientConfig {
 
     @Bean
     public WebClient webClient() {
-
+        System.out.println("webclient is applied");
         return WebClient.builder()
                 .filter((request, next) -> {
 

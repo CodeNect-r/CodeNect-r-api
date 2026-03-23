@@ -163,7 +163,38 @@ public class PromptFactory {
             :root { ... }
             @import "tailwindcss";   ← @import after any rule = ERROR
 
-        🔴 RULE S10 — SELF-REVIEW BEFORE OUTPUT:
+        🔴 RULE S11 — TAILWIND v4: @apply ONLY ACCEPTS BUILT-IN UTILITIES:
+        This project uses Tailwind CSS v4. In v4, @apply is STRICTLY limited to
+        built-in Tailwind utility classes. You CANNOT @apply a custom class.
+        Doing so crashes the build with "Cannot apply unknown utility class".
+
+          ✅ CORRECT — @apply with built-in utilities only:
+            @layer components {
+              .my-card {
+                @apply rounded-xl border border-white/10 bg-white/5 p-6;
+              }
+            }
+
+          ❌ INCORRECT — @apply-ing a custom class (BREAKS BUILD in v4):
+            @layer components {
+              .card { @apply rounded-xl p-6; }
+              .card-hover { @apply card hover:bg-white/10; }
+              ← "card" is custom, not a Tailwind utility → build crash
+            }
+
+          ❌ ALSO INCORRECT — chaining custom classes through @apply:
+            .btn-primary { @apply btn text-white; }
+            ← "btn" is not a Tailwind utility → build crash
+
+        RULE: If you want to reuse styles, copy the utility classes directly
+        into each selector — do NOT reference one custom class from another.
+
+        ALSO: In Tailwind v4, avoid defining @layer components { } blocks in
+        the CSS entry file at all when possible. Prefer writing utility classes
+        directly in JSX className attributes. If you must use @layer components,
+        only use genuine Tailwind utilities inside @apply, never custom names.
+
+        🔴 RULE S12 — SELF-REVIEW BEFORE OUTPUT:
         Before outputting any file, mentally scan for:
           □ Every backtick has a matching backtick
           □ Every ' has a matching '
@@ -174,6 +205,8 @@ public class PromptFactory {
           □ Every component file has "export default" at the top or bottom
           □ No "default function" without "export" in front of it
           □ All CSS @import lines appear before any rules or :root blocks
+          □ No @apply references a custom class — only built-in Tailwind utilities
+          □ No @layer components block chains custom class names via @apply
         ══════════════════════════════════════════════════════════
         """;
 
@@ -737,8 +770,12 @@ public class PromptFactory {
         1. @import for Google Font (if not already in index.html)
         2. CSS custom properties for any custom design tokens:
            --font-display, --font-body (matching the Google Font)
-        3. Any @layer components { } overrides for custom global styles
-        4. Responsive base styles for html/body if needed
+        3. Base styles for html/body if needed — use @layer base { }
+        4. AVOID @layer components { } entirely if possible — prefer Tailwind
+           utility classes directly in JSX className attributes instead.
+           If @layer components is used, ONLY @apply built-in Tailwind utilities:
+             ✅ @apply rounded-xl border border-white/10 bg-white/5 p-6;
+             ❌ @apply card;  ← custom class name → "Cannot apply unknown utility" crash
 
         ⚠️ CRITICAL — @import ORDER IN CSS:
         The @import "tailwindcss" directive (or Google Fonts @import) MUST
@@ -880,8 +917,15 @@ public class PromptFactory {
                 After @import "tailwindcss"; you may add:
                   - @import url('https://fonts.googleapis.com/...') for custom fonts
                   - @layer base { } for custom base styles
-                  - @layer components { } for any reusable component styles
+                  - @layer components { } — ONLY with built-in Tailwind utilities inside @apply
                   - CSS custom properties for font family references
+
+                🚨 TAILWIND v4 @apply RESTRICTION:
+                Inside any @layer components block, @apply ONLY accepts built-in
+                Tailwind utility classes. NEVER @apply a custom class name.
+                  ✅ @apply rounded-xl border border-white/10 bg-white/5 p-6;
+                  ❌ @apply card hover:bg-white/10;  ← "card" is custom → BUILD CRASH
+                Prefer writing utility classes directly in JSX className instead.
                 """.formatted(filePath);
         } else {
             return """
