@@ -66,7 +66,7 @@ nginx:
       dir: C:/project/CodeNect-r/CodeNect-r-api/nginx/dynamic/
 
 jwt:
-  secret: ${JWT_SECRET:mysupersecurejwtsecretkeythatismorethan32byteslong}
+  secret: mysupersecurejwtsecretkeythatismorethan32byteslong
 
 internal:
   service:

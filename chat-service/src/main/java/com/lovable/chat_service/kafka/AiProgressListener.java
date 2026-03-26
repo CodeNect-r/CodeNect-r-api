@@ -12,7 +12,7 @@ public class AiProgressListener {
 
     private final SimpMessagingTemplate messagingTemplate;
 
-    @KafkaListener(topics = "ai.progress", groupId = "chat-service-progress-group")
+    @KafkaListener(topics = "ai.progress", groupId = "chat-service")
     public void onProgress(AiProgressEvent event) {
         if (event == null || event.getProjectId() == null) {
             System.err.println("Progress event missing projectId: " + event);
@@ -20,9 +20,9 @@ public class AiProgressListener {
         }
 
                 // Always forward initial/progress updates on a project-scoped topic
-        String destination ="/topic/project/" + event.getProjectId() + "/session/" + event.getSessionId();
-
-        System.out.println("🚀 [WEBSOCKET] Forwarding status '" + event.getStatus() + "' to channel: " + destination);
-        messagingTemplate.convertAndSend(destination, event);
+        messagingTemplate.convertAndSend(
+                "/topic/project/" + event.getProjectId() + "/generation",
+                event
+        );
     }
 }

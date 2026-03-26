@@ -24,11 +24,10 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
+        System.out.println("hii");
 
-        if(SecurityContextHolder.getContext().getAuthentication()!=null){
-            filterChain.doFilter(request,response);
-            return;
-        }
+        System.out.println("AUTH HEADER: " + request.getHeader("Authorization"));
+
         String authHeader = request.getHeader("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
             filterChain.doFilter(request, response);
@@ -47,7 +46,11 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             );
             SecurityContextHolder.getContext().setAuthentication(auth);
             filterChain.doFilter(request, response);
+            System.out.println(role);
+
         } catch (Exception ex) {
+            System.out.println("denied");
+
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
         }
     }

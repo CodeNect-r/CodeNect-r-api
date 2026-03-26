@@ -16,204 +16,211 @@ public class PromptFactory {
      * ═══════════════════════════════════════════════════════════════
      *  ARCHITECTURE DECISION: TAILWIND CSS v4 BY DEFAULT
      *
-     *  All projects now use Tailwind CSS v4 unless the user explicitly
-     *  requests plain CSS. This eliminates the entire class of "CSS
-     *  completeness" bugs — with Tailwind, the AI writes utility
-     *  classes directly in JSX and there are no custom class names
-     *  that need to be separately defined in a CSS file.
+     *  FIX #9 (nested router): App.jsx MUST NOT contain BrowserRouter/Router.
+     *  main.jsx owns the single BrowserRouter. App.jsx uses only Routes+Route.
      *
-     *  MANDATORY TAILWIND FILES per framework (always generated):
+     *  FIX #10 (Tailwind v4 CSS): src/index.css MUST use @import "tailwindcss"
+     *  (v4 syntax). @tailwind base/components/utilities is v3 only and will
+     *  produce ZERO output in a v4 project, causing a blank unstyled page.
      *
-     *  react-vite:
-     *    - tailwindcss + @tailwindcss/vite in package.json devDeps
-     *    - vite.config.js: plugins: [react(), tailwindcss()]
-     *    - src/index.css: first line = @import "tailwindcss";
+     *  FIX #11 (Tailwind v4 @apply failures): In v4, many utilities that are
+     *  valid in JSX can still fail inside CSS @apply. To prevent build crashes,
+     *  this prompt strongly discourages @apply and prefers JSX utility usage.
      *
-     *  next.js:
-     *    - tailwindcss + postcss + autoprefixer in devDeps
-     *    - tailwind.config.js at ROOT
-     *    - postcss.config.js at ROOT
-     *    - app/globals.css: starts with @tailwind base/components/utilities
+     *  BUG 8 FIX (double-escaping): sanitize() was applying Java string escapes
+     *  to the context before injecting it into the prompt. This caused the LLM
+     *  to receive \\n instead of actual newlines and \\\" instead of quotes —
+     *  making all code snippets in the context unreadable. Removed sanitize()
+     *  from all prompt-building methods. The context is injected raw; JSON
+     *  escaping is the LLM's output responsibility, not input responsibility.
      *
-     *  react-cra:
-     *    - tailwindcss + autoprefixer in devDeps
-     *    - tailwind.config.js at ROOT
-     *    - src/index.css: starts with @tailwind base/components/utilities
-     *
-     *  vue-vite:
-     *    - tailwindcss + @tailwindcss/vite in package.json devDeps
-     *    - vite.config.js: plugins: [vue(), tailwindcss()]
-     *    - src/style.css: first line = @import "tailwindcss";
-     *
-     *  angular:
-     *    - tailwindcss + postcss + autoprefixer in devDeps
-     *    - tailwind.config.js at ROOT
-     *    - src/styles.css: starts with @tailwind base/components/utilities
-     *
-     *  FIX #5 (sanitize bypass): buildCssAuditPrompt() takes raw
-     *  List<GeneratedFile> — never sanitized — so className regex works.
-     *
-     *  FIX #6 (CSS order): CSS file is always last in required files list.
-     *
-     *  FIX #7 (regen CSS re-audit): regenerateSystemPrompt() now
-     *  explicitly includes CSS file in impacted files.
-     *
-     *  FIX #8 (JSX syntax safety): Added comprehensive JSX/JS syntax
-     *  rules to prevent unterminated strings, broken template literals,
-     *  and other syntax errors that cause build failures.
+     *  BUG 9 FIX (36 rules losing LLM attention): The monolithic
+     *  JSX_SYNTAX_SAFETY_RULES block with S1–S36 caused attention dilution.
+     *  Rules are now split into focused groups injected contextually:
+     *    - CRITICAL_JSX_RULES: the 6 rules that most commonly cause build failures
+     *    - TAILWIND_RULES: Tailwind-specific rules grouped by framework version
+     *    - ROUTER_RULES: single-router enforcement
+     *    - SAFETY_RULES: prop safety, optional chaining, null guards
+     *  Each prompt injects only the groups relevant to what it's generating.
      * ═══════════════════════════════════════════════════════════════
      */
 
-    /* =======================================================
-       🚨 JSX / JS SYNTAX SAFETY RULES — FIX #8
-       Injected into EVERY file-generation prompt to prevent
-       syntax errors that break the build (e.g. unterminated
-       string literals, broken template literals, bad JSX).
-    ======================================================= */
+    // ─────────────────────────────────────────────────────────────
+    //  BUG 9 FIX: Focused rule groups instead of one giant S1-S36 block.
+    //  LLMs follow ~6-8 rules reliably in a block. Beyond that, attention
+    //  drops off sharply. We inject only what's needed per prompt.
+    // ─────────────────────────────────────────────────────────────
 
-    private static final String JSX_SYNTAX_SAFETY_RULES = """
+    /**
+     * The 6 rules that directly cause esbuild/vite parse failures.
+     * Injected into EVERY generation prompt.
+     */
+    private static final String CRITICAL_JSX_RULES = """
         ══════════════════════════════════════════════════════════
-        🚨 JSX / JAVASCRIPT SYNTAX RULES — VIOLATIONS BREAK BUILD
+        🚨 CRITICAL JSX BUILD RULES — VIOLATIONS BREAK THE BUILD
         ══════════════════════════════════════════════════════════
 
-        🔴 RULE S1 — TEMPLATE LITERAL CLOSING POSITION:
-        The closing backtick MUST come AFTER the last } of the expression.
+        🔴 RULE 1 — TEMPLATE LITERAL CLOSING:
+          ✅ `$${value.toFixed(2)}`
+          ❌ `$${value.toFixed(2)`}
 
-          ✅ CORRECT:   `$${value.toFixed(2)}`
-          ❌ INCORRECT: `$${value.toFixed(2)`}
-          ✅ CORRECT:   `Hello ${name}, you have ${count} items`
-          ❌ INCORRECT: `Hello ${name}, you have ${count}`  ← if used inside JSX {} without outer backtick pair
+        🔴 RULE 2 — NO UNTERMINATED STRINGS:
+          ✅ {count === 0 ? 'FREE' : 'Paid'}
+          ❌ {count === 0 ? 'FREE : 'Paid'}
 
-        🔴 RULE S2 — TERNARY EXPRESSIONS WITH STRING LITERALS:
-        In JSX, every string in a ternary must be properly quoted.
+        🔴 RULE 3 — EXPORT DEFAULT IS MANDATORY on every component file:
+          ✅ export default function Footer() { ... }
+          ❌ function Footer() { ... }
 
-          ✅ CORRECT:   {isLoading ? 'Loading...' : 'Done'}
-          ✅ CORRECT:   {count === 0 ? 'FREE' : `$${count.toFixed(2)}`}
-          ❌ INCORRECT: {count === 0 ? 'FREE' : `$${count.toFixed(2)`}
-          ❌ INCORRECT: {count === 0 ? 'FREE : 'Done'}   ← missing closing quote
+        🔴 RULE 4 — ONE DEFAULT EXPORT PER FILE. No duplicates.
 
-        🔴 RULE S3 — JSX ATTRIBUTE STRINGS:
-        Attribute values must always have matching open/close quotes.
+        🔴 RULE 5 — NO DUPLICATE FUNCTION/COMPONENT NAMES in the same file.
 
-          ✅ CORRECT:   placeholder="Enter email"
-          ✅ CORRECT:   className="flex items-center gap-4"
-          ❌ INCORRECT: placeholder="Enter email
-          ❌ INCORRECT: className="flex items-center gap-4'  ← mismatched quotes
+        🔴 RULE 6 — ALL IMPORTS must resolve to real files or declared packages.
+          Never import a local file that is not in the planned file list.
+        🔴 RULE 7 — NO @apply IN CSS FILES (Tailwind v4)
+           Using @apply WILL BREAK BUILD.
+           Use className utilities in JSX instead.
+        ══════════════════════════════════════════════════════════
+        """;
 
-        🔴 RULE S4 — NO UNTERMINATED STRINGS ANYWHERE:
-        Every string literal — single-quoted, double-quoted, or backtick —
-        must have its closing delimiter before the line ends (or be a
-        deliberate multi-line template literal).
+    /**
+     * Tailwind v4 rules (react-vite / vue-vite). Injected only for v4 frameworks.
+     */
+    private static final String TAILWIND_V4_RULES = """
+        ══════════════════════════════════════════════════════════
+        🎨 TAILWIND v4 RULES (react-vite / vue-vite)
+        ══════════════════════════════════════════════════════════
 
-          ✅ CORRECT:   const msg = 'Hello world';
-          ❌ INCORRECT: const msg = 'Hello world;    ← missing closing quote
+        🔴 CSS ENTRY FILE — HARD REQUIREMENT:
+          FIRST LINE MUST BE EXACTLY: @import "tailwindcss";
 
-        🔴 RULE S5 — JSX EXPRESSION BRACES MUST BE BALANCED:
-        Every { opened inside JSX must have a matching }.
+          🚨 FORBIDDEN (silently broken in v4 — causes blank page):
+          @tailwind base;
+          @tailwind components;
+          @tailwind utilities;
 
-          ✅ CORRECT:   <span>{item.price.toFixed(2)}</span>
-          ❌ INCORRECT: <span>{item.price.toFixed(2)</span>   ← missing }
+        🔴 @apply POLICY — PREFER ZERO @apply:
+          ❌ NEVER: @apply font-sans; @apply text-lg; @apply font-bold;
+          ❌ NEVER: @apply tracking-wide; @apply leading-relaxed;
+          ❌ NEVER: @apply custom-class-name;
+          ✅ Put utility classes directly in JSX className instead.
 
-        🔴 RULE S6 — CONDITIONAL RENDERING PATTERNS:
-        Use these safe patterns only:
+        🔴 CSS @import ORDER — ALL @import before any rules or :root:
+          ✅ @import "tailwindcss";
+             @import url('...');
+             :root { ... }
+          ❌ :root { ... }
+             @import "tailwindcss";
 
-          ✅ {condition && <Component />}
-          ✅ {condition ? <A /> : <B />}
-          ✅ {condition ? 'text A' : 'text B'}
-          ❌ {condition && <Component />    ← missing closing }
-          ❌ {condition ? <A /> : <B />    ← missing closing }
+        🔴 vite.config.js MUST include: plugins: [react(), tailwindcss()]
+        🔴 package.json devDeps MUST include: tailwindcss ^4.0.0, @tailwindcss/vite ^4.0.0
+        
+        🚨 STRICT RULE — NEVER USE @apply IN TAILWIND v4
+            
+        ❌ FORBIDDEN:
+        @apply anything;
+            
+        ❌ FORBIDDEN:
+        @apply font-playfair;
+        @apply text-lg;
+        @apply font-bold;
+            
+        ✅ ALWAYS:
+        Use classes directly in JSX:
+        <div className="font-serif text-lg font-bold">
+            
+        🚨 ANY @apply usage WILL BREAK BUILD
+        ══════════════════════════════════════════════════════════
+        """;
 
-        🔴 RULE S7 — IMPORT STATEMENTS:
-        Every import path must be a complete, valid string.
+    /**
+     * Tailwind v3 rules (next / react-cra / angular). Injected only for v3 frameworks.
+     */
+    private static final String TAILWIND_V3_RULES = """
+        ══════════════════════════════════════════════════════════
+        🎨 TAILWIND v3 RULES (next / react-cra / angular)
+        ══════════════════════════════════════════════════════════
 
-          ✅ import Button from '../components/Button';
-          ❌ import Button from '../components/Button;   ← unterminated
+        🔴 CSS ENTRY FILE — HARD REQUIREMENT (ALL THREE LINES):
+          @tailwind base;
+          @tailwind components;
+          @tailwind utilities;
 
-        🔴 RULE S8 — EXPORT SYNTAX IS MANDATORY ON EVERY COMPONENT:
-        Every React component file MUST use "export default function" or
-        "export default ComponentName". NEVER write "default function" alone —
-        that is a syntax error and will crash the build immediately.
+          🚨 FORBIDDEN in v3: @import "tailwindcss"; (v4 only)
 
-          ✅ CORRECT:   export default function Footer() { ... }
-          ✅ CORRECT:   const Footer = () => { ... }; export default Footer;
-          ❌ INCORRECT: default function Footer() { ... }   ← missing "export"
-          ❌ INCORRECT: function Footer() { ... }            ← missing "export default"
+        🔴 REQUIRED CONFIG FILES: tailwind.config.js + postcss.config.js
+        🔴 package.json devDeps: tailwindcss ^3.4.0, postcss ^8.4.0, autoprefixer ^10.4.0
+        ══════════════════════════════════════════════════════════
+        """;
 
-        This applies to EVERY file: pages, components, layouts, hooks — all of them.
-        If a file has no export default, the app will fail to build or render a blank page.
+    /**
+     * Single-router enforcement rules. Only injected when generating App.jsx or main.jsx.
+     */
+    private static final String ROUTER_RULES = """
+        ══════════════════════════════════════════════════════════
+        🔴 ROUTER ARCHITECTURE — SINGLE BROWSERROUTER
+        ══════════════════════════════════════════════════════════
 
-        🔴 RULE S9 — CSS @import ORDER IS STRICT:
-        In any CSS file, ALL @import statements must appear at the very top,
-        before ANY rules, :root blocks, @layer, or selectors.
-        Putting @import after any rule causes a build warning or error.
+        BrowserRouter lives in src/main.jsx ONLY.
 
-          ✅ CORRECT ORDER:
-            @import "tailwindcss";
-            @import url('https://fonts.googleapis.com/...');
-            :root { --font-display: 'Inter', sans-serif; }
-            @layer components { ... }
+        ✅ CORRECT src/main.jsx:
+          import { BrowserRouter } from 'react-router-dom';
+          ReactDOM.createRoot(...).render(
+            <React.StrictMode>
+              <BrowserRouter><App /></BrowserRouter>
+            </React.StrictMode>
+          );
 
-          ❌ INCORRECT ORDER (BREAKS BUILD):
-            @import "tailwindcss";
-            :root { ... }
-            @import url('https://fonts.googleapis.com/...');   ← @import after :root = ERROR
-            @layer components { ... }
+        ✅ CORRECT src/App.jsx (NO Router wrapper):
+          import { Routes, Route } from 'react-router-dom';
+          export default function App() {
+            return (
+              <div className="flex flex-col min-h-screen bg-gray-950 text-white">
+                <Routes>
+                  <Route path="/" element={<Home />} />
+                </Routes>
+              </div>
+            );
+          }
 
-          ❌ ALSO INCORRECT:
-            :root { ... }
-            @import "tailwindcss";   ← @import after any rule = ERROR
+        ❌ WRONG src/App.jsx:
+          import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+          export default function App() {
+            return <Router><Routes>...</Routes></Router>; // CRASH: nested routers
+          }
+        ══════════════════════════════════════════════════════════
+        """;
 
-        🔴 RULE S11 — TAILWIND v4: @apply ONLY ACCEPTS BUILT-IN UTILITIES:
-        This project uses Tailwind CSS v4. In v4, @apply is STRICTLY limited to
-        built-in Tailwind utility classes. You CANNOT @apply a custom class.
-        Doing so crashes the build with "Cannot apply unknown utility class".
+    /**
+     * Runtime safety rules. Only injected for component/page files.
+     */
+    private static final String SAFETY_RULES = """
+        ══════════════════════════════════════════════════════════
+        🛡 RUNTIME SAFETY RULES
+        ══════════════════════════════════════════════════════════
 
-          ✅ CORRECT — @apply with built-in utilities only:
-            @layer components {
-              .my-card {
-                @apply rounded-xl border border-white/10 bg-white/5 p-6;
-              }
-            }
+        🔴 SAFE DESTRUCTURING — always provide fallback:
+          ✅ const { icon = null, title = 'Untitled' } = props || {};
+          ❌ const { icon } = e;  // crashes if e is undefined
 
-          ❌ INCORRECT — @apply-ing a custom class (BREAKS BUILD in v4):
-            @layer components {
-              .card { @apply rounded-xl p-6; }
-              .card-hover { @apply card hover:bg-white/10; }
-              ← "card" is custom, not a Tailwind utility → build crash
-            }
+        🔴 SAFE ARRAY MAP — guard before mapping:
+          ✅ items?.filter(Boolean).map((item, i) => <Card key={i} {...item} />)
+          ❌ items.map(...)  // crashes if items is undefined
 
-          ❌ ALSO INCORRECT — chaining custom classes through @apply:
-            .btn-primary { @apply btn text-white; }
-            ← "btn" is not a Tailwind utility → build crash
+        🔴 OPTIONAL CHAINING everywhere for dynamic data:
+          ✅ data?.user?.name
+          ❌ data.user.name
 
-        RULE: If you want to reuse styles, copy the utility classes directly
-        into each selector — do NOT reference one custom class from another.
+        🔴 EMPTY STATE GUARD before rendering dynamic lists:
+          ✅ if (!data || data.length === 0) return <EmptyState />;
 
-        ALSO: In Tailwind v4, avoid defining @layer components { } blocks in
-        the CSS entry file at all when possible. Prefer writing utility classes
-        directly in JSX className attributes. If you must use @layer components,
-        only use genuine Tailwind utilities inside @apply, never custom names.
-
-        🔴 RULE S12 — SELF-REVIEW BEFORE OUTPUT:
-        Before outputting any file, mentally scan for:
-          □ Every backtick has a matching backtick
-          □ Every ' has a matching '
-          □ Every " has a matching "
-          □ Every { inside JSX has a matching }
-          □ No line ends in the middle of a string literal
-          □ Template literal expressions use ${ } not ${ (missing closing brace)
-          □ Every component file has "export default" at the top or bottom
-          □ No "default function" without "export" in front of it
-          □ All CSS @import lines appear before any rules or :root blocks
-          □ No @apply references a custom class — only built-in Tailwind utilities
-          □ No @layer components block chains custom class names via @apply
+        🔴 NO ErrorBoundary — do not create, import, or use it in any form.
         ══════════════════════════════════════════════════════════
         """;
 
     /* =======================================================
        🎨 TAILWIND SETUP BLOCKS — per framework
-       These are injected into EVERY prompt to ensure the AI
-       generates ALL required Tailwind wiring files upfront.
     ======================================================= */
 
     private static final String TAILWIND_SETUP_REACT_VITE = """
@@ -221,12 +228,9 @@ public class PromptFactory {
         🎨 TAILWIND CSS v4 — react-vite  (MANDATORY SETUP)
         ══════════════════════════════════════════════════════════
 
-        ALL THREE WIRING POINTS MUST BE PRESENT — verify each:
-
         ┌─ POINT 1: package.json devDependencies ──────────────────┐
         │  "tailwindcss": "^4.0.0"                                 │
         │  "@tailwindcss/vite": "^4.0.0"                           │
-        │  Both MUST be present. Missing either = build fails.     │
         └──────────────────────────────────────────────────────────┘
 
         ┌─ POINT 2: vite.config.js ────────────────────────────────┐
@@ -236,21 +240,17 @@ public class PromptFactory {
         │  export default defineConfig({                           │
         │    plugins: [react(), tailwindcss()],                    │
         │  });                                                     │
-        │  ⚠️ tailwindcss() MISSING = Tailwind produces ZERO CSS   │
         └──────────────────────────────────────────────────────────┘
 
         ┌─ POINT 3: src/index.css — FIRST LINE MUST BE: ───────────┐
         │  @import "tailwindcss";                                  │
-        │  ⚠️ This line missing = Tailwind produces ZERO CSS        │
-        │  Do NOT use @tailwind base/components/utilities (v3)     │
+        │  🚨 Do NOT use @tailwind base/components/utilities (v3)  │
+        │     Those are silently ignored in v4 → blank page.       │
+        │  🚨 Prefer NO @apply usage in v4 CSS entry files         │
         └──────────────────────────────────────────────────────────┘
 
         ✅ NO tailwind.config.js needed (v4 handles it automatically)
         ✅ NO postcss.config.js needed (v4 uses Vite plugin directly)
-
-        USAGE IN JSX: use Tailwind utility classes directly
-          className="flex items-center gap-4 p-6 bg-gray-900 rounded-xl"
-          className="text-2xl font-bold text-white hover:text-indigo-400"
         ══════════════════════════════════════════════════════════
         """;
 
@@ -258,40 +258,10 @@ public class PromptFactory {
         ══════════════════════════════════════════════════════════
         🎨 TAILWIND CSS v3 — next.js  (MANDATORY SETUP)
         ══════════════════════════════════════════════════════════
-
-        ALL FOUR WIRING POINTS MUST BE PRESENT:
-
-        ┌─ POINT 1: package.json devDependencies ──────────────────┐
-        │  "tailwindcss": "^3.4.0"                                 │
-        │  "postcss": "^8.4.0"                                     │
-        │  "autoprefixer": "^10.4.0"                               │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 2: tailwind.config.js at ROOT (CJS) ──────────────┐
-        │  /** @type {import('tailwindcss').Config} */              │
-        │  module.exports = {                                      │
-        │    content: [                                            │
-        │      './app/**/*.{js,ts,jsx,tsx,mdx}',                   │
-        │      './pages/**/*.{js,ts,jsx,tsx,mdx}',                 │
-        │      './components/**/*.{js,ts,jsx,tsx,mdx}',            │
-        │    ],                                                    │
-        │    theme: { extend: {} },                                │
-        │    plugins: [],                                          │
-        │  };                                                      │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 3: postcss.config.js at ROOT (CJS) ───────────────┐
-        │  module.exports = {                                      │
-        │    plugins: { tailwindcss: {}, autoprefixer: {} },       │
-        │  };                                                      │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 4: app/globals.css — FIRST THREE LINES: ──────────┐
-        │  @tailwind base;                                         │
-        │  @tailwind components;                                   │
-        │  @tailwind utilities;                                    │
-        │  ⚠️ All three required. app/layout.jsx MUST import it.   │
-        └──────────────────────────────────────────────────────────┘
+        POINT 1: devDeps: tailwindcss ^3.4.0, postcss ^8.4.0, autoprefixer ^10.4.0
+        POINT 2: tailwind.config.js (CJS) with content: app/**,pages/**,components/**
+        POINT 3: postcss.config.js (CJS): module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } }
+        POINT 4: app/globals.css starts with @tailwind base; @tailwind components; @tailwind utilities;
         ══════════════════════════════════════════════════════════
         """;
 
@@ -299,30 +269,9 @@ public class PromptFactory {
         ══════════════════════════════════════════════════════════
         🎨 TAILWIND CSS v3 — React CRA  (MANDATORY SETUP)
         ══════════════════════════════════════════════════════════
-
-        ALL THREE WIRING POINTS MUST BE PRESENT:
-
-        ┌─ POINT 1: package.json devDependencies ──────────────────┐
-        │  "tailwindcss": "^3.4.0"                                 │
-        │  "autoprefixer": "^10.4.0"                               │
-        │  (CRA has PostCSS built in — no separate postcss needed) │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 2: tailwind.config.js at ROOT (CJS) ──────────────┐
-        │  module.exports = {                                      │
-        │    content: ['./src/**/*.{js,jsx,ts,tsx}',               │
-        │              './public/index.html'],                     │
-        │    theme: { extend: {} },                                │
-        │    plugins: [],                                          │
-        │  };                                                      │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 3: src/index.css — FIRST THREE LINES: ────────────┐
-        │  @tailwind base;                                         │
-        │  @tailwind components;                                   │
-        │  @tailwind utilities;                                    │
-        │  src/index.js MUST import './index.css'                  │
-        └──────────────────────────────────────────────────────────┘
+        POINT 1: devDeps: tailwindcss ^3.4.0, autoprefixer ^10.4.0
+        POINT 2: tailwind.config.js (CJS) with content: src/**
+        POINT 3: src/index.css starts with @tailwind base; @tailwind components; @tailwind utilities;
         ══════════════════════════════════════════════════════════
         """;
 
@@ -330,26 +279,11 @@ public class PromptFactory {
         ══════════════════════════════════════════════════════════
         🎨 TAILWIND CSS v4 — vue-vite  (MANDATORY SETUP)
         ══════════════════════════════════════════════════════════
-
-        ALL THREE WIRING POINTS MUST BE PRESENT:
-
-        ┌─ POINT 1: package.json devDependencies ──────────────────┐
-        │  "tailwindcss": "^4.0.0"                                 │
-        │  "@tailwindcss/vite": "^4.0.0"                           │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 2: vite.config.js ────────────────────────────────┐
-        │  import vue from '@vitejs/plugin-vue';                   │
-        │  import tailwindcss from '@tailwindcss/vite';            │
-        │  export default defineConfig({                           │
-        │    plugins: [vue(), tailwindcss()],                      │
-        │  });                                                     │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 3: src/style.css — FIRST LINE MUST BE: ───────────┐
-        │  @import "tailwindcss";                                  │
-        │  src/main.js MUST import './style.css'                   │
-        └──────────────────────────────────────────────────────────┘
+        POINT 1: devDeps: tailwindcss ^4.0.0, @tailwindcss/vite ^4.0.0
+        POINT 2: vite.config.js: plugins: [vue(), tailwindcss()]
+        POINT 3: src/style.css FIRST LINE: @import "tailwindcss";
+                 🚨 Do NOT use @tailwind directives (v3) — silently ignored in v4
+                 🚨 Prefer NO @apply usage
         ══════════════════════════════════════════════════════════
         """;
 
@@ -357,29 +291,9 @@ public class PromptFactory {
         ══════════════════════════════════════════════════════════
         🎨 TAILWIND CSS v3 — Angular  (MANDATORY SETUP)
         ══════════════════════════════════════════════════════════
-
-        ALL THREE WIRING POINTS MUST BE PRESENT:
-
-        ┌─ POINT 1: package.json devDependencies ──────────────────┐
-        │  "tailwindcss": "^3.4.0"                                 │
-        │  "autoprefixer": "^10.4.0"                               │
-        │  "postcss": "^8.4.0"                                     │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 2: tailwind.config.js at ROOT (CJS) ──────────────┐
-        │  module.exports = {                                      │
-        │    content: ['./src/**/*.{html,ts}'],                    │
-        │    theme: { extend: {} },                                │
-        │    plugins: [],                                          │
-        │  };                                                      │
-        └──────────────────────────────────────────────────────────┘
-
-        ┌─ POINT 3: src/styles.css — FIRST THREE LINES: ───────────┐
-        │  @tailwind base;                                         │
-        │  @tailwind components;                                   │
-        │  @tailwind utilities;                                    │
-        │  angular.json "styles": ["src/styles.css"]              │
-        └──────────────────────────────────────────────────────────┘
+        POINT 1: devDeps: tailwindcss ^3.4.0, autoprefixer ^10.4.0, postcss ^8.4.0
+        POINT 2: tailwind.config.js (CJS) with content: src/**/*.{html,ts}
+        POINT 3: src/styles.css starts with @tailwind base; @tailwind components; @tailwind utilities;
         ══════════════════════════════════════════════════════════
         """;
 
@@ -389,23 +303,17 @@ public class PromptFactory {
 
     private static final String DEPENDENCY_RULES_REACT_VITE = """
         📦 DEPENDENCIES — react-vite (Tailwind v4 always included)
-        GOLDEN RULE: import it → it MUST be in package.json.
-
         ALWAYS in package.json:
           react ^18.2.0, react-dom ^18.2.0, react-router-dom ^6.22.0,
           lucide-react ^0.395.0, framer-motion ^11.2.0, clsx ^2.1.1,
           axios ^1.7.2, date-fns ^3.6.0, zustand ^4.5.2, prop-types ^15.8.1
           vite ^5.0.0 (dev), @vitejs/plugin-react ^4.2.0 (dev),
           tailwindcss ^4.0.0 (dev), @tailwindcss/vite ^4.0.0 (dev)
-
-        EXTRAS (add before using): @tanstack/react-query, react-hook-form,
-          zod, recharts, react-hot-toast, @mui/material, antd, react-icons, lodash
+        NEVER import a package not listed here unless package.json is updated too.
         """;
 
     private static final String DEPENDENCY_RULES_NEXT = """
         📦 DEPENDENCIES — next.js (Tailwind v3 always included)
-        GOLDEN RULE: import it → it MUST be in package.json.
-
         ALWAYS in package.json:
           next ^14.2.0, react ^18.2.0, react-dom ^18.2.0,
           lucide-react ^0.395.0, framer-motion ^11.2.0, clsx ^2.1.1,
@@ -415,8 +323,6 @@ public class PromptFactory {
 
     private static final String DEPENDENCY_RULES_VUE_VITE = """
         📦 DEPENDENCIES — vue-vite (Tailwind v4 always included)
-        GOLDEN RULE: import it → it MUST be in package.json.
-
         ALWAYS in package.json:
           vue ^3.4.0, vue-router ^4.3.0, pinia ^2.1.7,
           @vueuse/core ^10.9.0, axios ^1.7.2, lucide-vue-next ^0.395.0,
@@ -426,8 +332,6 @@ public class PromptFactory {
 
     private static final String DEPENDENCY_RULES_REACT_CRA = """
         📦 DEPENDENCIES — react-cra (Tailwind v3 always included)
-        GOLDEN RULE: import it → it MUST be in package.json.
-
         ALWAYS in package.json:
           react ^18.2.0, react-dom ^18.2.0, react-scripts ^5.0.1,
           react-router-dom ^6.22.0, lucide-react ^0.395.0,
@@ -437,8 +341,6 @@ public class PromptFactory {
 
     private static final String DEPENDENCY_RULES_ANGULAR = """
         📦 DEPENDENCIES — angular (Tailwind v3 always included)
-        GOLDEN RULE: import it → it MUST be in package.json.
-
         ALWAYS in package.json:
           @angular/core ^17, @angular/common ^17, @angular/router ^17,
           @angular/forms ^17, @angular/platform-browser ^17,
@@ -458,53 +360,85 @@ public class PromptFactory {
     }
 
     public String buildPrompt(
-            String context, String userPrompt,
-            Set<String> impactedFiles, GenerationMode mode, String framework
+            String context,
+            String userPrompt,
+            Set<String> impactedFiles,
+            GenerationMode mode,
+            String framework
     ) {
-        String safeContext = sanitize(context);
+        // BUG 8 FIX: removed sanitize(context) — it was applying Java string escapes
+        // to the context before LLM injection, causing \\n and \\\" in code snippets.
+        // The context is now injected raw. The LLM sees actual newlines and quotes.
+        String tailwindRules = isV4Framework(framework) ? TAILWIND_V4_RULES : TAILWIND_V3_RULES;
 
         if (mode == GenerationMode.REGENERATE) {
             return """
             You are modifying an existing frontend project.
+
             🚨 FRAMEWORK (LOCKED): %s
+
             %s
             %s
             %s
+            %s
+            %s
+
             BEGIN CONTEXT
             %s
             END CONTEXT
+
             ALLOWED FILES: %s
+
             USER REQUEST: %s
+
             RULES:
             - Modify ONLY allowed files
             - DO NOT change framework, build system, or Tailwind setup
             - Keep Tailwind utility classes consistent
             - If you add a new import, add it to package.json
-            """.formatted(framework, getDependencyRules(framework),
-                    getTailwindSetup(framework), JSX_SYNTAX_SAFETY_RULES,
-                    safeContext, impactedFiles, userPrompt);
+            """.formatted(
+                    framework,
+                    getDependencyRules(framework),
+                    getTailwindSetup(framework),
+                    tailwindRules,
+                    ROUTER_RULES,
+                    CRITICAL_JSX_RULES,
+                    context,           // BUG 8 FIX: no sanitize()
+                    impactedFiles,
+                    userPrompt
+            );
         }
 
         return """
         You are building a complete frontend project from scratch.
+
         🚨 FRAMEWORK: %s
+
         %s
         %s
         %s
+        %s
+        %s
+
         ══════════════════════════════════════════
         🔴 MANDATORY FILES — ALL MUST APPEAR IN OUTPUT:
         ══════════════════════════════════════════
         %s
         ══════════════════════════════════════════
+
         USER REQUEST: %s
+
         OUTPUT: JSON array → [{ "path": "...", "content": "..." }, ...]
-        - Every mandatory file above must be present — including ALL Tailwind config files
-        - 3–4 page components beyond mandatory files
-        - Use Tailwind utility classes in all JSX/HTML
-        - Every imported package must be in package.json
-        """.formatted(framework, getDependencyRules(framework),
-                getTailwindSetup(framework), JSX_SYNTAX_SAFETY_RULES,
-                getRequiredFilesBlock(framework), userPrompt);
+        """.formatted(
+                framework,
+                getDependencyRules(framework),
+                getTailwindSetup(framework),
+                tailwindRules,
+                ROUTER_RULES,
+                CRITICAL_JSX_RULES,
+                getRequiredFilesBlock(framework),
+                userPrompt
+        );
     }
 
     /* =======================================================
@@ -513,17 +447,15 @@ public class PromptFactory {
 
     public String detectFramework(String prompt) {
         String p = prompt.toLowerCase();
-        if (p.contains("next"))                                  return "next";
-        if (p.contains("vue"))                                   return "vue-vite";
-        if (p.contains("angular"))                               return "angular";
+        if (p.contains("next")) return "next";
+        if (p.contains("vue")) return "vue-vite";
+        if (p.contains("angular")) return "angular";
         if (p.contains("cra") || p.contains("create react app")) return "react-cra";
         return "react-vite";
     }
 
     /* =======================================================
        📐 PLANNING
-       FIX #6: CSS/config files are always listed LAST so they
-       are generated after all JSX files exist.
     ======================================================= */
 
     public String buildPlanningSystemPrompt() {
@@ -531,69 +463,44 @@ public class PromptFactory {
         You are a frontend project planner.
         Return ONLY valid JSON: { "framework": "...", "files": [...] }
 
-        ══════════════════════════════════════════
-        🔴 MANDATORY FILE ORDER — CRITICAL:
+        🔴 MANDATORY FILE ORDER:
+        react-vite: ["package.json","vite.config.js","index.html","src/main.jsx","src/App.jsx",...pages,...components,"src/index.css"]
+        next: ["package.json","next.config.js","tailwind.config.js","postcss.config.js","app/layout.jsx",...pages,...components,"app/globals.css"]
+        react-cra: ["package.json","tailwind.config.js","public/index.html","src/index.jsx","src/App.jsx",...,"src/index.css"]
+        vue-vite: ["package.json","vite.config.js","index.html","src/main.js","src/App.vue",...,"src/style.css"]
+        angular: ["package.json","angular.json","tsconfig.json","tailwind.config.js","src/main.ts","src/index.html",...,"src/styles.css"]
 
-        react-vite (Tailwind v4 — ALWAYS):
-          ["package.json", "vite.config.js", "index.html",
-           "src/main.jsx", "src/App.jsx",
-           ...page files..., ...component files...,
-           "src/index.css"]   ← CSS MUST BE LAST
-
-        next.js (Tailwind v3 — ALWAYS):
-          ["package.json", "next.config.js",
-           "tailwind.config.js", "postcss.config.js",
-           "app/layout.jsx", ...page files..., ...component files...,
-           "app/globals.css"]   ← CSS MUST BE LAST
-
-        react-cra (Tailwind v3 — ALWAYS):
-          ["package.json", "tailwind.config.js",
-           "public/index.html", "src/index.jsx", "src/App.jsx",
-           ...page files..., ...component files...,
-           "src/index.css"]   ← CSS MUST BE LAST
-
-        vue-vite (Tailwind v4 — ALWAYS):
-          ["package.json", "vite.config.js", "index.html",
-           "src/main.js", "src/App.vue",
-           ...page files..., ...component files...,
-           "src/style.css"]   ← CSS MUST BE LAST
-
-        angular (Tailwind v3 — ALWAYS):
-          ["package.json", "angular.json", "tsconfig.json",
-           "tailwind.config.js",
-           "src/main.ts", "src/index.html",
-           ...component files...,
-           "src/styles.css"]   ← CSS MUST BE LAST
-
-        🔴 WHY CSS IS LAST: The CSS file is generated after all JSX/TS
-        files exist so it can be audited for actual Tailwind usage.
-        ══════════════════════════════════════════
-
-        RULES:
-        - ONE framework, 8–14 files, 3–4 pages, 1+ shared component
-        - Tailwind config files MUST always be in the list
-        - CSS entry file MUST be the last item in the list
-        - package.json MUST include Tailwind devDependencies
-
-        OUTPUT: JSON only. No markdown.
+        CSS entry file MUST be LAST.
+        Total 8-14 files.
+        Every import path that will be used later must map to a real planned file.
+        OUTPUT: JSON only.
         """;
     }
 
     public String buildPlanningPrompt(String userPrompt, String framework) {
         return """
         USER REQUEST: %s
+
         🚨 FORCED FRAMEWORK: %s
+
         %s
         %s
-        🔴 FILE LIST MUST FOLLOW THIS PATTERN:
+
+        🔴 FILE LIST PATTERN:
         %s
-        Total 8–14 files. 3–4 pages.
-        CSS file MUST be last. Tailwind config files MUST be included.
-        Every imported package must appear in package.json.
-        """.formatted(userPrompt, framework,
+
+        Total 8-14 files.
+        CSS file MUST be last.
+        Tailwind config files MUST be included if required by framework.
+        Do not plan files that will never be imported.
+        Do not invent aliases unless config supports them.
+        """.formatted(
+                userPrompt,
+                framework,
                 getDependencyRules(framework),
                 getTailwindSetup(framework),
-                getRequiredFilesBlock(framework));
+                getRequiredFilesBlock(framework)
+        );
     }
 
     /* =======================================================
@@ -613,50 +520,17 @@ public class PromptFactory {
             - Escape double-quotes as \\", newlines as \\n
             - No markdown fences, no explanation outside JSON
 
-            ══════════════════════════════════════════════════════════
-            🔴 RULE 1 — TAILWIND CSS IS ALWAYS USED:
-            ══════════════════════════════════════════════════════════
-            Every project uses Tailwind CSS. Use utility classes in all JSX/HTML.
-            DO NOT write custom CSS class definitions for layout/styling.
-            DO NOT use plain CSS class names like className="hero-section".
-
-            All Tailwind wiring files MUST be generated (see user prompt for setup).
-            For the CSS entry file: first line MUST be the correct Tailwind directive.
-
-            GOOD examples:
-              className="flex flex-col min-h-screen bg-gray-950 text-white"
-              className="grid grid-cols-1 md:grid-cols-3 gap-6 p-8"
-              className="rounded-xl border border-white/10 bg-white/5 p-6 hover:bg-white/10 transition-all"
-              className="text-4xl font-bold text-white font-display"
-              className="px-6 py-3 bg-indigo-600 hover:bg-indigo-500 rounded-lg font-semibold transition-colors"
-
-            BAD examples (DO NOT DO):
-              className="hero-section"  ← no custom class names
-              className="stats-grid"    ← no custom class names
-              className="feature-card"  ← no custom class names
-            ══════════════════════════════════════════════════════════
-
-            🔴 RULE 2 — IMPORT/PACKAGE CONTRACT:
-            Every import must have a matching package.json entry.
-
             %s
 
-            🎨 DESIGN QUALITY (all UI files):
-            - Google Font via @import or <link> — NEVER system fonts
-            - Strong dark/light theme with consistent color palette
-            - Hover + focus + active states using Tailwind hover:/focus: variants
-            - Smooth transitions: transition-all duration-200/300
-            - Cards: rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm
-            - Buttons: px-6 py-3 rounded-lg font-semibold with hover: color shift
-            - Sticky nav: sticky top-0 z-50 backdrop-blur-md bg-black/80 border-b border-white/10
-            - Mobile-first: sm: md: lg: breakpoints throughout
-            - Typography: font-display for headings, tracking-tight, proper weights
-            - Premium quality — Vercel / Linear / Stripe level
-            """.formatted(JSX_SYNTAX_SAFETY_RULES);
+            🎨 DESIGN QUALITY:
+            Google Fonts, dark theme, hover states, transitions,
+            rounded-xl cards, proper buttons, sticky nav, mobile-first responsive.
+            """.formatted(CRITICAL_JSX_RULES);
         }
 
         return """
         Modify EXACTLY ONE file.
+
         RULES:
         - Keep Tailwind CSS approach — do NOT switch to plain CSS
         - Only update required logic
@@ -664,57 +538,100 @@ public class PromptFactory {
         - Return JSON only: { "path": "...", "content": "..." }
 
         %s
-        """.formatted(JSX_SYNTAX_SAFETY_RULES);
+        """.formatted(CRITICAL_JSX_RULES);
     }
 
     public String buildSingleFilePrompt(
-            String context, String userPrompt, String filePath,
-            Set<String> impactedFiles, GenerationMode mode, String framework
+            String context,
+            String userPrompt,
+            String filePath,
+            Set<String> impactedFiles,
+            GenerationMode mode,
+            String framework
     ) {
-        String safeContext = sanitize(context);
+        // BUG 8 FIX: removed sanitize(context). Injecting context raw so the LLM
+        // sees real newlines and quotes in previously generated code snippets.
+        String tailwindRules = isV4Framework(framework) ? TAILWIND_V4_RULES : TAILWIND_V3_RULES;
+
+        // Inject router rules only for files where it's relevant
+        boolean needsRouterRules = filePath.contains("App.jsx") || filePath.contains("App.tsx")
+                || filePath.contains("main.jsx") || filePath.contains("main.tsx");
+        String routerBlock = needsRouterRules ? ROUTER_RULES : "";
+
+        // Inject safety rules only for component/page files
+        boolean needsSafetyRules = filePath.endsWith(".jsx") || filePath.endsWith(".tsx")
+                || filePath.endsWith(".vue");
+        String safetyBlock = needsSafetyRules ? SAFETY_RULES : "";
 
         if (mode == GenerationMode.REGENERATE) {
             return """
             Modify this file ONLY.
-            FRAMEWORK: %s  FILE: %s  REQUEST: %s
+
+            FRAMEWORK: %s
+            FILE: %s
+            REQUEST: %s
+
             %s
             %s
-            CONTEXT: %s
-            RULES:
-            - Keep Tailwind CSS — do NOT introduce plain CSS class names
-            - If you add a new import, it must be in package.json
+            %s
+            %s
+            %s
+
+            CONTEXT:
+            %s
+
             OUTPUT: { "path": "%s", "content": "..." }
-            """.formatted(framework, filePath, userPrompt,
-                    getTailwindSetup(framework), JSX_SYNTAX_SAFETY_RULES,
-                    safeContext, filePath);
+            """.formatted(
+                    framework,
+                    filePath,
+                    userPrompt,
+                    getTailwindSetup(framework),
+                    tailwindRules,
+                    routerBlock,
+                    safetyBlock,
+                    CRITICAL_JSX_RULES,
+                    context,           // BUG 8 FIX: no sanitize()
+                    filePath
+            );
         }
 
         String fileSpecificRules = getFileSpecificRules(filePath, framework);
 
         return """
         Generate this file for the project.
+
         FRAMEWORK: %s
         FILE TO GENERATE: %s
+
         %s
         %s
         %s
         %s
+        %s
+        %s
+
         USER REQUEST CONTEXT: %s
-        ALREADY GENERATED FILES (for import reference): %s
+        ALREADY GENERATED FILES (for import reference):
+        %s
+
         OUTPUT: { "path": "%s", "content": "..." }
-        """.formatted(framework, filePath,
+        """.formatted(
+                framework,
+                filePath,
                 fileSpecificRules,
                 getDependencyRules(framework),
                 getTailwindSetup(framework),
-                JSX_SYNTAX_SAFETY_RULES,
-                userPrompt, safeContext, filePath);
+                tailwindRules,
+                routerBlock,
+                CRITICAL_JSX_RULES,
+                userPrompt,
+                context,           // BUG 8 FIX: no sanitize()
+                filePath
+        );
     }
 
     /* =======================================================
-       🔍 CSS AUDIT PROMPT — FIX #2
-       Called by generation service AFTER all JSX files exist,
-       BEFORE CSS file is generated. Takes raw (unsanitized)
-       files so className regex works correctly — FIX #5.
+       🔍 CSS AUDIT PROMPT
     ======================================================= */
 
     public String buildCssAuditPrompt(
@@ -723,21 +640,21 @@ public class PromptFactory {
             String userPrompt
     ) {
         String cssPath = getCssEntryPath(framework);
-        boolean isV4   = framework.equals("react-vite") || framework.equals("vue-vite");
+        boolean isV4 = framework.equals("react-vite") || framework.equals("vue-vite");
 
-        // FIX #5: use raw file content (not sanitized) so className regex matches
         Set<String> tailwindClasses = new LinkedHashSet<>();
-        StringBuilder jsxSnippets   = new StringBuilder();
+        StringBuilder jsxSnippets = new StringBuilder();
 
         for (GeneratedFile file : generatedFiles) {
             String path = file.getPath();
             if (!path.endsWith(".jsx") && !path.endsWith(".tsx")
                     && !path.endsWith(".vue") && !path.endsWith(".ts")
-                    && !path.endsWith(".html")) continue;
+                    && !path.endsWith(".html")) {
+                continue;
+            }
 
             tailwindClasses.addAll(extractTailwindClasses(file.getContent()));
 
-            // Include first 40 lines for structural context
             String[] lines = file.getContent().split("\n");
             jsxSnippets.append("\n// ").append(path).append("\n");
             for (int i = 0; i < Math.min(40, lines.length); i++) {
@@ -749,18 +666,58 @@ public class PromptFactory {
                 ? "@import \"tailwindcss\";"
                 : "@tailwind base;\n@tailwind components;\n@tailwind utilities;";
 
+        String warning = isV4
+                ? """
+          🚨 CRITICAL TAILWIND v4 RULES (STRICT — NO EXCEPTIONS):
+
+          1. FIRST LINE MUST BE:
+             @import "tailwindcss";
+
+          2. 🚨 @apply IS STRICTLY FORBIDDEN
+             ❌ DO NOT USE @apply under ANY condition
+             ❌ @apply font-playfair;
+             ❌ @apply text-lg;
+             ❌ @apply anything;
+
+             🚨 USING @apply WILL BREAK THE BUILD
+
+          3. 🚨 DO NOT CREATE CUSTOM CLASSES
+             ❌ font-playfair
+             ❌ text-custom
+             ❌ any non-standard utility
+
+          4. 🚨 DO NOT STYLE FONTS USING TAILWIND CLASSES
+             Use Google Fonts + inline style in JSX if needed
+
+          5. KEEP CSS MINIMAL
+             Only:
+             - Tailwind import
+             - :root variables
+             - optional base styles
+
+          6. MOVE ALL STYLING INTO JSX
+             Use className instead of CSS rules
+
+          🚨 ANY VIOLATION WILL BREAK THE BUILD
+          """
+                : """
+                  This directive loads Tailwind.
+                  Without it, ALL utility classes produce zero CSS.
+                  """;
+
         return """
         Generate the CSS entry file for this project.
+
         FILE: %s
         FRAMEWORK: %s
+
         %s
 
         ══════════════════════════════════════════════════════════
         🔴 MANDATORY — THIS FILE MUST START WITH:
         %s
 
-        This directive is what loads Tailwind. Without it, ALL
-        Tailwind utility classes produce zero CSS output.
+        %s
         ══════════════════════════════════════════════════════════
 
         TAILWIND CLASSES DETECTED IN JSX FILES:
@@ -768,29 +725,11 @@ public class PromptFactory {
 
         ADDITIONAL REQUIREMENTS after the Tailwind directive:
         1. @import for Google Font (if not already in index.html)
-        2. CSS custom properties for any custom design tokens:
-           --font-display, --font-body (matching the Google Font)
-        3. Base styles for html/body if needed — use @layer base { }
-        4. AVOID @layer components { } entirely if possible — prefer Tailwind
-           utility classes directly in JSX className attributes instead.
-           If @layer components is used, ONLY @apply built-in Tailwind utilities:
-             ✅ @apply rounded-xl border border-white/10 bg-white/5 p-6;
-             ❌ @apply card;  ← custom class name → "Cannot apply unknown utility" crash
-
-        ⚠️ CRITICAL — @import ORDER IN CSS:
-        The @import "tailwindcss" directive (or Google Fonts @import) MUST
-        come BEFORE any rules, :root blocks, or @layer declarations.
-        Wrong order causes build warnings and may break styles.
-
-        CORRECT order:
-          @import "tailwindcss";
-          @import url('https://fonts.googleapis.com/...');
-          :root { ... }
-          @layer components { ... }
-
-        WRONG order (DO NOT DO):
-          :root { ... }
-          @import "tailwindcss";   ← @import after rules = WARNING/ERROR
+        2. CSS custom properties for design tokens
+        3. @layer base { } for base styles if needed
+        4. Prefer utility classes in JSX over @layer components
+        5. 🚨 NEVER USE @apply — IT WILL BREAK THE BUILD
+        ⚠️ ALL @import statements must come before any rules or :root blocks.
 
         USER REQUEST CONTEXT: %s
 
@@ -800,11 +739,13 @@ public class PromptFactory {
         OUTPUT FORMAT — return ONLY this JSON:
         { "path": "%s", "content": "..." }
         """.formatted(
-                cssPath, framework,
+                cssPath,
+                framework,
                 getTailwindSetup(framework),
                 directive,
+                warning,
                 tailwindClasses.isEmpty()
-                        ? "(no specific classes found — rely on JSX previews below)"
+                        ? "(none found — use JSX previews below)"
                         : String.join(", ", tailwindClasses.stream().limit(50).collect(Collectors.toList())),
                 userPrompt,
                 jsxSnippets.length() > 6000
@@ -822,59 +763,101 @@ public class PromptFactory {
         return switch (filePath) {
 
             case "package.json" -> """
-                🔴 FILE CONTRACT — package.json  (framework: %s)
-                Generate COMPLETE package.json with ALL Tailwind deps.
-                "type": "module" for vite-based projects.
-                Content MUST be escaped JSON string — NOT nested object.
+                🔴 FILE CONTRACT — package.json (framework: %s)
 
                 For react-vite MUST include:
                 {
-                  "name": "app", "version": "0.0.0", "private": true, "type": "module",
-                  "scripts": { "dev":"vite", "build":"vite build", "preview":"vite preview" },
-                  "dependencies": {
-                    "react":"^18.2.0", "react-dom":"^18.2.0",
-                    "react-router-dom":"^6.22.0", "lucide-react":"^0.395.0",
-                    "framer-motion":"^11.2.0", "clsx":"^2.1.1",
-                    "axios":"^1.7.2", "prop-types":"^15.8.1"
+                  "name":"app",
+                  "version":"0.0.0",
+                  "private":true,
+                  "type":"module",
+                  "scripts":{"dev":"vite","build":"vite build","preview":"vite preview"},
+                  "dependencies":{
+                    "react":"^18.2.0",
+                    "react-dom":"^18.2.0",
+                    "react-router-dom":"^6.22.0",
+                    "lucide-react":"^0.395.0",
+                    "framer-motion":"^11.2.0",
+                    "clsx":"^2.1.1",
+                    "axios":"^1.7.2",
+                    "prop-types":"^15.8.1"
                   },
-                  "devDependencies": {
-                    "vite":"^5.0.0", "@vitejs/plugin-react":"^4.2.0",
-                    "tailwindcss":"^4.0.0", "@tailwindcss/vite":"^4.0.0"
+                  "devDependencies":{
+                    "vite":"^5.0.0",
+                    "@vitejs/plugin-react":"^4.2.0",
+                    "tailwindcss":"^4.0.0",
+                    "@tailwindcss/vite":"^4.0.0"
                   }
                 }
+
+                If code imports any extra external package, package.json MUST include it too.
                 """.formatted(framework);
 
             case "vite.config.js" -> """
-                🔴 FILE CONTRACT — vite.config.js  (ALWAYS includes Tailwind)
+                🔴 FILE CONTRACT — vite.config.js (ALWAYS includes Tailwind):
                 import { defineConfig } from 'vite';
                 import react from '@vitejs/plugin-react';
                 import tailwindcss from '@tailwindcss/vite';
-                export default defineConfig({ plugins: [react(), tailwindcss()] });
-                ⚠️ tailwindcss() MUST be in plugins — without it = zero CSS output.
+
+                export default defineConfig({
+                  plugins: [react(), tailwindcss()]
+                });
+
+                ⚠️ tailwindcss() MUST be in plugins.
                 """;
 
             case "tailwind.config.js" -> getTailwindConfigContract(framework);
 
             case "postcss.config.js" ->
-                    "🔴 postcss.config.js: module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };";
+                    "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };";
 
             case "index.html" -> """
-                🔴 index.html at PROJECT ROOT (not src/index.html).
-                <div id="root"></div>
-                <script type="module" src="/src/main.jsx"></script>
-                Add Google Font <link> in <head>.
+                🔴 index.html at PROJECT ROOT.
+                Must include:
+                - <div id="root"></div>
+                - <script type="module" src="/src/main.jsx"></script>
+                - optional Google Font <link> in <head>
                 """;
 
             case "src/main.jsx" -> """
-                🔴 src/main.jsx:
+                🔴 src/main.jsx — THE ONLY FILE THAT SHOULD CONTAIN BrowserRouter:
+
                 import React from 'react';
                 import ReactDOM from 'react-dom/client';
                 import { BrowserRouter } from 'react-router-dom';
                 import App from './App';
-                import './index.css';   ← MUST import Tailwind CSS entry
+                import './index.css';
+
                 ReactDOM.createRoot(document.getElementById('root')).render(
-                  <React.StrictMode><BrowserRouter><App /></BrowserRouter></React.StrictMode>
+                  <React.StrictMode>
+                    <BrowserRouter>
+                      <App />
+                    </BrowserRouter>
+                  </React.StrictMode>
                 );
+
+                🚨 App.jsx MUST NOT contain any Router.
+                """;
+
+            case "src/App.jsx" -> """
+                🔴 src/App.jsx — MUST NOT CONTAIN BrowserRouter, Router, or HashRouter:
+
+                import React from 'react';
+                import { Routes, Route } from 'react-router-dom';
+
+                export default function App() {
+                  return (
+                    <div className="flex flex-col min-h-screen bg-gray-950 text-white">
+                      <main className="flex-grow">
+                        <Routes>
+                          <Route path="/" element={<Home />} />
+                        </Routes>
+                      </main>
+                    </div>
+                  );
+                }
+
+                🚨 DO NOT import BrowserRouter, Router, or HashRouter here.
                 """;
 
             case "src/index.css", "app/globals.css", "src/style.css", "src/styles.css" ->
@@ -883,9 +866,11 @@ public class PromptFactory {
             default -> """
                 🔴 FILE: %s (framework: %s)
                 Generate complete, production-quality file using Tailwind CSS.
-                Use Tailwind utility classes directly in JSX — no custom class names.
-                Every import must be in package.json.
-                Use lucide-react for all icons.
+                Use Tailwind utility classes directly in JSX.
+                Every external import must be in package.json.
+                Every local import path must point to a real planned file.
+                Do NOT wrap in BrowserRouter — routing is handled by main.jsx/App.jsx.
+                Do NOT create ErrorBoundary — it is forbidden.
                 """.formatted(filePath, framework);
         };
     }
@@ -895,67 +880,45 @@ public class PromptFactory {
 
         if (isV4) {
             return """
-                🔴 FILE CONTRACT — %s  (Tailwind v4)
+                🔴 FILE CONTRACT — %s (Tailwind v4)
                 ─────────────────────────────────────────────────
                 FIRST LINE MUST BE EXACTLY:
                 @import "tailwindcss";
 
-                ⚠️ This is the only required Tailwind directive for v4.
-                   Without it, ALL utility classes produce ZERO CSS output.
-                   Do NOT use @tailwind base/components/utilities (v3 syntax).
+                🚨 DO NOT USE v3 DIRECTIVES:
+                   @tailwind base;
+                   @tailwind components;
+                   @tailwind utilities;
 
-                ⚠️ @import ORDER IS MANDATORY:
-                   ALL @import statements must come before any rules.
-                   CORRECT:
-                     @import "tailwindcss";
-                     @import url('https://fonts.googleapis.com/...');
-                     :root { ... }
-                   WRONG:
-                     :root { ... }
-                     @import "tailwindcss";   ← causes build warning/error
+                🚨 PREFER NO @apply. Move styling into JSX className.
 
-                After @import "tailwindcss"; you may add:
-                  - @import url('https://fonts.googleapis.com/...') for custom fonts
-                  - @layer base { } for custom base styles
-                  - @layer components { } — ONLY with built-in Tailwind utilities inside @apply
-                  - CSS custom properties for font family references
+                🚨 FORBIDDEN @apply:
+                   ❌ @apply font-sans; @apply text-lg; @apply font-bold;
 
-                🚨 TAILWIND v4 @apply RESTRICTION:
-                Inside any @layer components block, @apply ONLY accepts built-in
-                Tailwind utility classes. NEVER @apply a custom class name.
-                  ✅ @apply rounded-xl border border-white/10 bg-white/5 p-6;
-                  ❌ @apply card hover:bg-white/10;  ← "card" is custom → BUILD CRASH
-                Prefer writing utility classes directly in JSX className instead.
+                CORRECT structure:
+                  @import "tailwindcss";
+                  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+                  :root {
+                    --font-display: 'Inter', sans-serif;
+                  }
+
+                  @layer base {
+                    html { scroll-behavior: smooth; }
+                    body { margin: 0; font-family: var(--font-display); }
+                  }
                 """.formatted(filePath);
         } else {
             return """
-                🔴 FILE CONTRACT — %s  (Tailwind v3)
+                🔴 FILE CONTRACT — %s (Tailwind v3)
                 ─────────────────────────────────────────────────
                 FIRST THREE LINES MUST BE EXACTLY:
                 @tailwind base;
                 @tailwind components;
                 @tailwind utilities;
 
-                ⚠️ All three directives required. Without them = zero CSS output.
-                   Do NOT use @import "tailwindcss" (v4 syntax).
-
-                ⚠️ @import ORDER IS MANDATORY:
-                   ALL @import statements must come before any rules.
-                   CORRECT:
-                     @tailwind base;
-                     @tailwind components;
-                     @tailwind utilities;
-                     @import url('https://fonts.googleapis.com/...');
-                     :root { ... }
-                   WRONG:
-                     :root { ... }
-                     @import url('...');   ← causes build warning/error
-
-                After the directives you may add:
-                  - @import for Google Fonts
-                  - @layer base { } for custom base styles
-                  - @layer components { } for reusable patterns
-                  - CSS custom properties
+                Do NOT use @import "tailwindcss" (v4 syntax).
+                ALL @import statements must come before any rules or :root blocks.
                 """.formatted(filePath);
         }
     }
@@ -963,39 +926,34 @@ public class PromptFactory {
     private String getTailwindConfigContract(String framework) {
         return switch (framework) {
             case "next" -> """
-                🔴 tailwind.config.js (next, CJS — MANDATORY):
-                /** @type {import('tailwindcss').Config} */
+                🔴 tailwind.config.js (next, CJS):
                 module.exports = {
-                  content: ['./app/**/*.{js,ts,jsx,tsx,mdx}',
-                            './pages/**/*.{js,ts,jsx,tsx,mdx}',
-                            './components/**/*.{js,ts,jsx,tsx,mdx}'],
-                  theme: { extend: {} }, plugins: [],
+                  content: [
+                    './app/**/*.{js,ts,jsx,tsx,mdx}',
+                    './pages/**/*.{js,ts,jsx,tsx,mdx}',
+                    './components/**/*.{js,ts,jsx,tsx,mdx}'
+                  ],
+                  theme: { extend: {} },
+                  plugins: []
                 };
                 """;
             case "react-cra" -> """
-                🔴 tailwind.config.js (react-cra, CJS — MANDATORY):
+                🔴 tailwind.config.js (react-cra, CJS):
                 module.exports = {
                   content: ['./src/**/*.{js,jsx,ts,tsx}','./public/index.html'],
-                  theme: { extend: {} }, plugins: [],
+                  theme: { extend: {} },
+                  plugins: []
                 };
                 """;
             case "angular" -> """
-                🔴 tailwind.config.js (angular, CJS — MANDATORY):
+                🔴 tailwind.config.js (angular, CJS):
                 module.exports = {
                   content: ['./src/**/*.{html,ts}'],
-                  theme: { extend: {} }, plugins: [],
+                  theme: { extend: {} },
+                  plugins: []
                 };
                 """;
-            case "vue-vite" -> """
-                🔴 tailwind.config.js NOT needed for vue-vite v4.
-                The @tailwindcss/vite plugin handles configuration automatically.
-                DO NOT generate this file for vue-vite.
-                """;
-            default -> """
-                🔴 tailwind.config.js NOT needed for react-vite v4.
-                The @tailwindcss/vite plugin handles configuration automatically.
-                DO NOT generate this file for react-vite.
-                """;
+            default -> "🔴 tailwind.config.js NOT needed for " + framework + " v4. DO NOT generate.";
         };
     }
 
@@ -1008,24 +966,27 @@ public class PromptFactory {
     }
 
     public String buildSummaryPrompt(
-            String userPrompt, String framework,
-            List<GeneratedFile> files, GenerationMode mode
+            String userPrompt,
+            String framework,
+            List<GeneratedFile> files,
+            GenerationMode mode
     ) {
-        String fileList = files.stream().map(GeneratedFile::getPath).collect(Collectors.joining(", "));
+        String fileList = files.stream()
+                .map(GeneratedFile::getPath)
+                .collect(Collectors.joining(", "));
         return "REQUEST: %s\nFRAMEWORK: %s\nMODE: %s\nFILES: %s"
                 .formatted(userPrompt, framework, mode.name(), fileList);
     }
 
     /* =======================================================
-       🔧 PUBLIC UTILITIES — used by generation service + validator
+       🔧 PUBLIC UTILITIES
     ======================================================= */
 
-    /** FIX #1: Sort file list so CSS is always last, JSX/TSX first. */
     public List<String> sortFilesForGeneration(List<String> files) {
         return files.stream()
                 .sorted((a, b) -> {
-                    boolean aIsCss  = a.endsWith(".css");
-                    boolean bIsCss  = b.endsWith(".css");
+                    boolean aIsCss = a.endsWith(".css");
+                    boolean bIsCss = b.endsWith(".css");
                     boolean aIsJson = a.equals("package.json");
                     boolean bIsJson = b.equals("package.json");
                     boolean aIsConfig = a.endsWith(".config.js") || a.endsWith(".config.ts")
@@ -1033,13 +994,10 @@ public class PromptFactory {
                     boolean bIsConfig = b.endsWith(".config.js") || b.endsWith(".config.ts")
                             || b.equals("angular.json") || b.equals("tsconfig.json");
 
-                    // package.json first
                     if (aIsJson && !bIsJson) return -1;
                     if (!aIsJson && bIsJson) return 1;
-                    // config files second
                     if (aIsConfig && !bIsConfig) return -1;
                     if (!aIsConfig && bIsConfig) return 1;
-                    // CSS files last
                     if (aIsCss && !bIsCss) return 1;
                     if (!aIsCss && bIsCss) return -1;
                     return 0;
@@ -1047,26 +1005,19 @@ public class PromptFactory {
                 .collect(Collectors.toList());
     }
 
-    /** Returns the CSS entry file path for a given framework. */
     public String getCssEntryPath(String framework) {
         return switch (framework) {
-            case "next"     -> "app/globals.css";
+            case "next" -> "app/globals.css";
             case "vue-vite" -> "src/style.css";
-            case "angular"  -> "src/styles.css";
-            default         -> "src/index.css";
+            case "angular" -> "src/styles.css";
+            default -> "src/index.css";
         };
     }
 
-    /**
-     * Extracts unique Tailwind utility class names from JSX/HTML content.
-     * Used by buildCssAuditPrompt() and BuildValidator.
-     * FIX #5: works on raw (unsanitized) content.
-     */
     public Set<String> extractTailwindClasses(String content) {
         Set<String> classes = new LinkedHashSet<>();
         if (content == null || content.isBlank()) return classes;
 
-        // Match className="..." static strings
         Pattern p = Pattern.compile("(?:className|class)=[\"']([^\"']+)[\"']");
         Matcher m = p.matcher(content);
         while (m.find()) {
@@ -1076,7 +1027,6 @@ public class PromptFactory {
                     .forEach(classes::add);
         }
 
-        // Match className={`...`} template literals
         Pattern tp = Pattern.compile("(?:className|class)=\\{`([^`]+)`\\}");
         Matcher tm = tp.matcher(content);
         while (tm.find()) {
@@ -1090,11 +1040,13 @@ public class PromptFactory {
         return classes;
     }
 
-    /** Heuristic: does this class token look like a Tailwind utility class? */
     private boolean looksLikeTailwind(String cls) {
-        if (!cls.contains("-") && !List.of("flex","grid","block","hidden","relative",
-                "absolute","fixed","sticky","overflow","truncate","uppercase",
-                "lowercase","capitalize","italic","underline","container").contains(cls)) {
+        if (!cls.contains("-") && !List.of(
+                "flex", "grid", "block", "hidden", "relative",
+                "absolute", "fixed", "sticky", "overflow", "truncate",
+                "uppercase", "lowercase", "capitalize", "italic",
+                "underline", "container"
+        ).contains(cls)) {
             return false;
         }
         if (cls.startsWith("${") || cls.contains("(") || cls.contains(")")) return false;
@@ -1105,52 +1057,50 @@ public class PromptFactory {
        🔧 PRIVATE HELPERS
     ======================================================= */
 
+    private boolean isV4Framework(String framework) {
+        return "react-vite".equals(framework) || "vue-vite".equals(framework);
+    }
+
     private String getTailwindSetup(String framework) {
         return switch (framework) {
-            case "next"      -> TAILWIND_SETUP_NEXT;
+            case "next" -> TAILWIND_SETUP_NEXT;
             case "react-cra" -> TAILWIND_SETUP_REACT_CRA;
-            case "vue-vite"  -> TAILWIND_SETUP_VUE_VITE;
-            case "angular"   -> TAILWIND_SETUP_ANGULAR;
-            default          -> TAILWIND_SETUP_REACT_VITE;
+            case "vue-vite" -> TAILWIND_SETUP_VUE_VITE;
+            case "angular" -> TAILWIND_SETUP_ANGULAR;
+            default -> TAILWIND_SETUP_REACT_VITE;
         };
     }
 
     private String getDependencyRules(String framework) {
         return switch (framework) {
-            case "next"      -> DEPENDENCY_RULES_NEXT;
-            case "vue-vite"  -> DEPENDENCY_RULES_VUE_VITE;
+            case "next" -> DEPENDENCY_RULES_NEXT;
+            case "vue-vite" -> DEPENDENCY_RULES_VUE_VITE;
             case "react-cra" -> DEPENDENCY_RULES_REACT_CRA;
-            case "angular"   -> DEPENDENCY_RULES_ANGULAR;
-            default          -> DEPENDENCY_RULES_REACT_VITE;
+            case "angular" -> DEPENDENCY_RULES_ANGULAR;
+            default -> DEPENDENCY_RULES_REACT_VITE;
         };
     }
 
-    /**
-     * FIX #6: CSS entry file is always LAST.
-     * Tailwind config files are always explicitly listed.
-     */
     private String getRequiredFilesBlock(String framework) {
         return switch (framework) {
 
             case "react-vite" -> """
                 1.  package.json       ← react, react-dom, router, lucide, framer-motion;
-                                         devDeps: vite, @vitejs/plugin-react,
-                                         tailwindcss ^4, @tailwindcss/vite ^4
-                2.  vite.config.js     ← plugins: [react(), tailwindcss()] — BOTH REQUIRED
+                                         devDeps: vite, @vitejs/plugin-react, tailwindcss ^4, @tailwindcss/vite ^4
+                2.  vite.config.js     ← plugins: [react(), tailwindcss()]
                 3.  index.html         ← ROOT level, Google Font <link>, <div id="root">
-                4.  src/main.jsx       ← ReactDOM.createRoot, BrowserRouter, imports ./index.css
-                5.  src/App.jsx        ← Routes for all pages
-                6+. src/pages/...      ← page components
-                7+. src/components/... ← shared components
-                LAST: src/index.css    ← FIRST LINE: @import "tailwindcss"; (MANDATORY)
+                4.  src/main.jsx       ← ReactDOM.createRoot, BrowserRouter (ONLY HERE), imports ./index.css
+                5.  src/App.jsx        ← Routes+Route ONLY — NO BrowserRouter/Router wrapper
+                6+. src/pages/...
+                7+. src/components/...
+                LAST: src/index.css    ← FIRST LINE: @import "tailwindcss"; (v4 — NOT @tailwind directives)
                 """;
 
             case "next" -> """
-                1.  package.json       ← next, react, react-dom;
-                                         devDeps: tailwindcss ^3, postcss, autoprefixer
+                1.  package.json       ← devDeps: tailwindcss ^3, postcss, autoprefixer
                 2.  next.config.js
                 3.  tailwind.config.js ← CJS, content covers app/**,pages/**,components/**
-                4.  postcss.config.js  ← CJS: module.exports with tailwindcss+autoprefixer
+                4.  postcss.config.js  ← CJS: tailwindcss+autoprefixer
                 5.  app/layout.jsx     ← imports './globals.css'
                 6+. app/page files
                 7+. components/
@@ -1158,8 +1108,7 @@ public class PromptFactory {
                 """;
 
             case "react-cra" -> """
-                1.  package.json       ← react, react-dom, react-scripts;
-                                         devDeps: tailwindcss ^3, autoprefixer
+                1.  package.json       ← devDeps: tailwindcss ^3, autoprefixer
                 2.  tailwind.config.js ← CJS, content covers src/**
                 3.  public/index.html
                 4.  src/index.jsx      ← imports './index.css'
@@ -1170,21 +1119,18 @@ public class PromptFactory {
                 """;
 
             case "vue-vite" -> """
-                1.  package.json       ← vue, vue-router, pinia;
-                                         devDeps: vite, @vitejs/plugin-vue,
-                                         tailwindcss ^4, @tailwindcss/vite ^4
-                2.  vite.config.js     ← plugins: [vue(), tailwindcss()] — BOTH REQUIRED
-                3.  index.html         ← ROOT level
+                1.  package.json       ← devDeps: vite, @vitejs/plugin-vue, tailwindcss ^4, @tailwindcss/vite ^4
+                2.  vite.config.js     ← plugins: [vue(), tailwindcss()]
+                3.  index.html
                 4.  src/main.js        ← imports './style.css'
                 5.  src/App.vue
                 6+. src/views/...
                 7+. src/components/...
-                LAST: src/style.css    ← FIRST LINE: @import "tailwindcss"; (MANDATORY)
+                LAST: src/style.css    ← FIRST LINE: @import "tailwindcss"; (v4 — NOT @tailwind directives)
                 """;
 
             case "angular" -> """
-                1.  package.json       ← @angular/core +deps;
-                                         devDeps: tailwindcss ^3, postcss, autoprefixer
+                1.  package.json       ← devDeps: tailwindcss ^3, postcss, autoprefixer
                 2.  angular.json       ← "styles": ["src/styles.css"]
                 3.  tsconfig.json
                 4.  tailwind.config.js ← CJS, content: src/**/*.{html,ts}
@@ -1207,53 +1153,33 @@ public class PromptFactory {
         You are a senior frontend engineer and award-winning UI designer.
         All projects use Tailwind CSS.
 
-        ══════════════════════════════════════════
-        🔴 RULE 1 — TAILWIND CSS IS MANDATORY:
-        Every project uses Tailwind CSS utility classes.
-        Do NOT write custom CSS class names like className="hero-section".
-        Use utility classes: className="flex flex-col bg-gray-950 text-white p-8"
+        🔴 RULE 1 — TAILWIND CSS IS MANDATORY.
+        🔴 RULE 2 — TAILWIND WIRING:
+          react-vite/vue-vite (v4): CSS entry uses @import "tailwindcss" (NOT @tailwind directives)
+          next/cra/angular (v3): CSS entry uses @tailwind base/components/utilities
 
-        🔴 RULE 2 — TAILWIND WIRING (all 3 points required):
-        react-vite/vue-vite (v4):
-          ① tailwindcss+@tailwindcss/vite in devDeps
-          ② vite.config.js: plugins:[react/vue(),tailwindcss()]
-          ③ CSS entry: @import "tailwindcss"; as first line
+        🔴 RULE 3 — CSS FILE IS GENERATED LAST.
+        🔴 RULE 4 — IMPORT/PACKAGE CONTRACT: every external import in package.json.
+        🔴 RULE 5 — MANDATORY FILES per framework (see buildPrompt for details).
 
-        next/cra/angular (v3):
-          ① tailwindcss+postcss+autoprefixer in devDeps
-          ② tailwind.config.js with correct content paths
-          ③ CSS entry: @tailwind base/components/utilities as first 3 lines
-          (+ postcss.config.js for next/vue-vite v3)
+        🔴 RULE 6 — ROUTER ARCHITECTURE (react-vite):
+        BrowserRouter lives in src/main.jsx ONLY.
+        src/App.jsx contains ONLY Routes and Route — NO Router wrapper.
 
-        🔴 RULE 3 — CSS FILE IS GENERATED LAST:
-        Generate ALL JSX/TS/Vue files before the CSS entry file.
-        The CSS file only needs the Tailwind directive — no component classes.
+        🔴 RULE 7 — TAILWIND v4 BUILD STABILITY:
+        Prefer NO @apply usage in react-vite / vue-vite projects.
+        Use utility classes directly in JSX.
 
-        🔴 RULE 4 — IMPORT/PACKAGE CONTRACT:
-        Every import must be in package.json.
-
-        🔴 RULE 5 — MANDATORY FILES:
-        react-vite : package.json, vite.config.js, index.html, src/index.css (LAST)
-        next       : package.json, tailwind.config.js, postcss.config.js, app/globals.css (LAST)
-        react-cra  : package.json, tailwind.config.js, src/index.css (LAST)
-        vue-vite   : package.json, vite.config.js, index.html, src/style.css (LAST)
-        angular    : package.json, tailwind.config.js, angular.json, src/styles.css (LAST)
-        ══════════════════════════════════════════
+        🔴 RULE 8 — NO ErrorBoundary. Do not create, import, or use it.
 
         %s
 
-        DESIGN STANDARDS (using Tailwind):
-        - Google Fonts — add via <link> in index.html or @import in CSS
-        - Dark theme by default: bg-gray-950, bg-gray-900, text-white
-        - Consistent accent color: indigo-500/600 or any strong accent
-        - Cards: rounded-xl border border-white/10 bg-white/5 p-6
-        - Buttons: px-6 py-3 bg-indigo-600 hover:bg-indigo-500 rounded-lg
-        - Nav: sticky top-0 backdrop-blur-md bg-black/80 border-b border-white/10
-        - Transitions: transition-all duration-200 or transition-colors duration-300
-        - Responsive: always use sm: md: lg: breakpoints
+        DESIGN:
+        Google Fonts, dark theme bg-gray-950, indigo accent, rounded-xl cards,
+        sticky nav, responsive sm/md/lg breakpoints, transitions.
 
         OUTPUT: JSON array only. No markdown. No explanation.
-        """.formatted(JSX_SYNTAX_SAFETY_RULES);
+        """.formatted(CRITICAL_JSX_RULES);
     }
 
     private String regenerateSystemPrompt() {
@@ -1263,24 +1189,21 @@ public class PromptFactory {
         RULES:
         - Do NOT change framework, build system, or Tailwind setup
         - Modify only explicitly allowed files
-        - Use Tailwind utility classes — do NOT add plain CSS class names
+        - Use Tailwind utility classes — avoid plain CSS class systems
         - Preserve existing Tailwind config files
         - If you add a new import, add it to package.json
-        - FIX #7: If JSX changes introduce new Tailwind utility usage,
-          the CSS entry file may need re-auditing — include it in output
-          if its Tailwind directive needs to be verified/fixed
+        - App.jsx MUST NOT contain BrowserRouter/Router — main.jsx owns routing
+        - For Tailwind v4, prefer NO @apply usage
+        - Do NOT create or import ErrorBoundary — it is forbidden
 
         %s
 
         OUTPUT: JSON array only. No explanation.
-        """.formatted(JSX_SYNTAX_SAFETY_RULES);
+        """.formatted(CRITICAL_JSX_RULES);
     }
 
-    private String sanitize(String input) {
-        if (input == null) return "";
-        return input
-                .replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n");
-    }
+    // BUG 8 FIX: sanitize() method removed entirely. It was applying Java string
+    // escaping (\\ → \\\\, " → \", \n → \\n) to code context before injecting into
+    // the prompt. This made all code examples in the context unreadable to the LLM.
+    // The context is now always injected as-is.
 }
