@@ -1,4 +1,4 @@
-package com.lovable.ai_service.kafka;
+package com.lovable.ai_service.consumer;
 
 import com.lovable.ai_service.dto.AiRequestEvent;
 import com.lovable.ai_service.service.AiOrchestratorService;

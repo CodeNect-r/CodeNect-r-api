@@ -3,12 +3,19 @@ package com.lovable.ai_service.validation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.lovable.ai_service.dto.GeneratedFile;
+import com.lovable.ai_service.dto.GenerationMode;
+import com.lovable.ai_service.service.AiClientService;
 import com.lovable.ai_service.service.PromptFactory;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @Component
 @Slf4j
@@ -16,9 +23,10 @@ public class BuildAutoFixer {
 
     private final ObjectMapper mapper = new ObjectMapper();
 
-    // FIX #4: inject PromptFactory to access getCssEntryPath()
     @Autowired
     private PromptFactory promptFactory;
+    @Autowired
+    private AiClientService aiClientService;
 
     public GeneratedFile fix(
             String issue,
@@ -28,27 +36,35 @@ public class BuildAutoFixer {
     ) {
         log.info("🛠 Fixing issue: {}", issue);
 
-        // ── Tailwind wiring issues (FIX #4) ───────────────────────
+        if (issue.startsWith("MISSING_LOCAL_IMPORT:")) {
+            return fixMissingImport(issue, files, userPrompt, framework);
+        }
+
         if (issue.startsWith("TAILWIND_WIRING:")) {
             return fixTailwindWiring(issue, files, framework);
         }
 
-        // ── CSS pipeline issues ────────────────────────────────────
         if (issue.startsWith("CSS_PIPELINE:")) {
             return fixCssPipeline(issue, files, framework);
         }
 
-        // ── Plain CSS class used instead of Tailwind (FIX #4) ─────
         if (issue.startsWith("CSS_MISSING_CLASS:")) {
             return fixPlainCssClass(issue, files, framework);
         }
 
-        // ── Missing dependency ─────────────────────────────────────
         if (issue.startsWith("MISSING_DEP:")) {
             return fixMissingDependency(issue, files, framework);
         }
 
-        // ── package.json issues ────────────────────────────────────
+        if (issue.startsWith("DUPLICATE_COMPONENT:")) {
+            return fixDuplicateComponent(issue, files);
+        }
+
+        // BUG 11: handle nested router issue raised by the new validator check
+        if (issue.startsWith("NESTED_ROUTER:")) {
+            return fixNestedRouter(issue, files);
+        }
+
         if (issue.toLowerCase().contains("package.json")
                 || issue.contains("Missing or invalid script")
                 || issue.contains("Missing dependency")
@@ -56,7 +72,6 @@ public class BuildAutoFixer {
             return fixPackageJson(files, framework);
         }
 
-        // ── Missing individual files ───────────────────────────────
         if (issue.contains("Missing file: index.html")) return fixIndexHtml(framework);
         if (issue.contains("Missing file: vite.config.js") || issue.contains("vite.config"))
             return fixViteConfig(files, framework);
@@ -74,27 +89,22 @@ public class BuildAutoFixer {
     }
 
     /* =======================================================
-       TAILWIND WIRING FIXER (FIX #4)
+       TAILWIND WIRING FIXER
     ======================================================= */
 
     private GeneratedFile fixTailwindWiring(String issue, List<GeneratedFile> files, String framework) {
-        // Missing Tailwind directive in CSS entry file
         if (issue.contains("missing @import") || issue.contains("missing @tailwind")) {
             return fixCssEntryFile(files, framework);
         }
-        // vite.config.js missing tailwindcss() plugin
         if (issue.contains("vite.config.js")) {
             return fixViteConfig(files, framework);
         }
-        // Missing tailwind.config.js
         if (issue.contains("tailwind.config.js")) {
             return fixTailwindConfig(framework);
         }
-        // Missing postcss.config.js
         if (issue.contains("postcss.config.js")) {
             return fixPostcssConfig(framework);
         }
-        // Missing Tailwind devDeps — fix package.json
         if (issue.contains("tailwindcss missing") || issue.contains("@tailwindcss/vite missing")
                 || issue.contains("autoprefixer missing") || issue.contains("postcss missing")) {
             return fixPackageJson(files, framework);
@@ -103,19 +113,8 @@ public class BuildAutoFixer {
         return null;
     }
 
-    /* =======================================================
-       PLAIN CSS CLASS FIXER (FIX #4)
-       When the AI used a plain CSS class name instead of Tailwind
-       utility classes, we can't easily fix the JSX automatically.
-       Instead we flag it and trigger a CSS entry file regeneration
-       to at least ensure Tailwind is loaded — the real fix requires
-       the JSX to be regenerated using the CSS audit prompt.
-    ======================================================= */
-
     private GeneratedFile fixPlainCssClass(String issue, List<GeneratedFile> files, String framework) {
-        log.warn("⚠️ Plain CSS class detected — CSS entry file will be regenerated. "
-                + "For full fix, regenerate the JSX file using buildCssAuditPrompt().");
-        // Ensure the CSS entry file at minimum has the Tailwind directive
+        log.warn("⚠️ Plain CSS class detected — CSS entry file will be regenerated.");
         return fixCssEntryFile(files, framework);
     }
 
@@ -304,7 +303,6 @@ public class BuildAutoFixer {
         String header;
         if (isV4) {
             header = "@import \"tailwindcss\";\n\n";
-            // Remove any v3 directives
             existing = existing
                     .replaceAll("@tailwind base;?\\s*", "")
                     .replaceAll("@tailwind components;?\\s*", "")
@@ -455,6 +453,47 @@ public class BuildAutoFixer {
     }
 
     /* =======================================================
+       BUG 11 FIX — NESTED ROUTER FIXER
+       Strip BrowserRouter/Router imports and JSX usage from App.jsx.
+       Replaces the outer Router wrapper with a plain div if present.
+    ======================================================= */
+
+    private GeneratedFile fixNestedRouter(String issue, List<GeneratedFile> files) {
+        // Parse the file path from the issue string: "NESTED_ROUTER: src/App.jsx imports..."
+        String filePath = issue.replace("NESTED_ROUTER:", "").trim().split(" ")[0];
+
+        GeneratedFile file = files.stream()
+                .filter(f -> f.getPath().equals(filePath))
+                .findFirst()
+                .orElse(null);
+
+        if (file == null) {
+            log.warn("⚠️ Could not find file to fix nested router: {}", filePath);
+            return null;
+        }
+
+        String content = file.getContent();
+
+        // Remove router imports
+        content = content.replaceAll(
+                "(?m)^import\\s+\\{[^}]*(?:BrowserRouter|HashRouter|Router)[^}]*\\}\\s+from\\s+'react-router-dom';?\\n?", "");
+
+        // Add clean import if Routes/Route are still needed
+        if (content.contains("<Routes") && !content.contains("import { Routes")) {
+            content = "import { Routes, Route } from 'react-router-dom';\n" + content;
+        }
+
+        // Remove Router wrapper JSX (<BrowserRouter> ... </BrowserRouter> or <Router> ... </Router>)
+        content = content.replaceAll("<(?:BrowserRouter|HashRouter)>\\s*", "");
+        content = content.replaceAll("\\s*</(?:BrowserRouter|HashRouter)>", "");
+        content = content.replaceAll("<Router>\\s*", "");
+        content = content.replaceAll("\\s*</Router>", "");
+
+        log.info("✅ Removed nested router from {}", filePath);
+        return GeneratedFile.builder().path(filePath).content(content).build();
+    }
+
+    /* =======================================================
        HELPERS
     ======================================================= */
 
@@ -505,5 +544,162 @@ public class BuildAutoFixer {
             case "autoprefixer"     -> "^10.4.0";
             default                 -> "latest";
         };
+    }
+
+    /**
+     * BUG 2 FIX — The original fixDuplicateComponent did:
+     *   String[] parts = issue.split(":");
+     *   String filePath = parts[1];
+     *
+     * But the issue format is "DUPLICATE_COMPONENT:src/pages/Home.jsx:ComponentName"
+     * so parts[0]="DUPLICATE_COMPONENT", parts[1]="src/pages/Home.jsx", parts[2]="ComponentName".
+     * parts[1] was correctly the file path! BUT: paths containing "/" would survive
+     * the split fine. The real bug was that the file path is also split by ":" on
+     * Windows-style paths (e.g. "C:\path") but more commonly the bug manifests
+     * because the duplicate-removal logic (removeDuplicateFunctions) deleted lines
+     * containing the function name anywhere — including lines inside the body.
+     * That's fixed in fixDuplicateComponentDeclaration in BuildValidator.
+     *
+     * This method now delegates to BuildValidator's fixed implementation and only
+     * handles the issue-string parsing (which was actually correct).
+     */
+    private GeneratedFile fixDuplicateComponent(String issue, List<GeneratedFile> files) {
+        try {
+            // Issue format: "DUPLICATE_COMPONENT:filePath:componentName"
+            // Use indexOf to avoid splitting on "/" inside the file path
+            int firstColon  = issue.indexOf(':');
+            int secondColon = issue.indexOf(':', firstColon + 1);
+
+            if (firstColon < 0 || secondColon < 0) {
+                log.warn("⚠️ Cannot parse DUPLICATE_COMPONENT issue: {}", issue);
+                return null;
+            }
+
+            String filePath = issue.substring(firstColon + 1, secondColon);
+
+            GeneratedFile file = files.stream()
+                    .filter(f -> f.getPath().equals(filePath))
+                    .findFirst()
+                    .orElse(null);
+
+            if (file == null) return null;
+
+            // Delegate to the brace-aware fixer in BuildValidator
+            BuildValidator validator = new BuildValidator(null, promptFactory);
+            String fixed = validator.fixDuplicateComponentDeclaration(file.getContent());
+
+            log.info("✅ Fixed duplicate component in {}", filePath);
+
+            return GeneratedFile.builder()
+                    .path(filePath)
+                    .content(fixed)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("❌ Failed fixing duplicate component", e);
+            return null;
+        }
+    }
+
+    /**
+     * BUG 7 FIX — The prompt (RULE S18) says "ERROR BOUNDARY IS STRICTLY FORBIDDEN"
+     * but fixMissingImport() used to generate a full ErrorBoundary class whenever
+     * the missing import path contained "ErrorBoundary". This directly contradicted
+     * the prompt and caused the LLM to get confused about whether to use it.
+     *
+     * Fix: if the missing import is an ErrorBoundary, don't generate it — instead
+     * remove all references to ErrorBoundary from the importing file. This resolves
+     * the contradiction: the prompt says don't use it, the fixer now agrees.
+     */
+    private GeneratedFile fixMissingImport(
+            String issue,
+            List<GeneratedFile> files,
+            String userPrompt,
+            String framework
+    ) {
+        try {
+            // Issue format: "MISSING_LOCAL_IMPORT: sourcePath -> ./Foo => src/Foo.jsx"
+            int arrowIdx = issue.lastIndexOf("=>");
+            String path = arrowIdx >= 0
+                    ? issue.substring(arrowIdx + 2).trim()
+                    : issue.substring(issue.indexOf("=>") + 2).trim();
+
+            // Already exists — nothing to do
+            if (files.stream().anyMatch(f -> f.getPath().equals(path))) return null;
+
+            // BUG 7 FIX: If the missing import is ErrorBoundary, remove references
+            // from the importing file instead of generating the forbidden component.
+            if (path.contains("ErrorBoundary")) {
+                log.info("🚫 ErrorBoundary import detected — removing references from importer (RULE S18)");
+                return removeErrorBoundaryFromImporter(issue, files);
+            }
+
+            // AI-generate the missing file
+            GeneratedFile generated = aiClientService.generateSingleFile(
+                    buildContext(files),
+                    userPrompt + "\nGenerate missing file: " + path,
+                    path,
+                    files.stream().map(GeneratedFile::getPath).collect(Collectors.toSet()),
+                    GenerationMode.REGENERATE,
+                    framework
+            );
+
+            if (generated == null || generated.getContent().isBlank()) {
+                return fallbackComponent(path);
+            }
+
+            return generated;
+
+        } catch (Exception e) {
+            return fallbackComponent("Fallback.jsx");
+        }
+    }
+
+    /**
+     * Remove ErrorBoundary import and usage from the file that tried to import it.
+     * Parse the importer path from the issue string.
+     */
+    private GeneratedFile removeErrorBoundaryFromImporter(String issue, List<GeneratedFile> files) {
+        // Issue format: "MISSING_LOCAL_IMPORT: src/App.jsx -> ./ErrorBoundary => src/ErrorBoundary.jsx"
+        int colonIdx = issue.indexOf(':');
+        int arrowIdx = issue.indexOf("->", colonIdx);
+        if (colonIdx < 0 || arrowIdx < 0) return null;
+
+        String importerPath = issue.substring(colonIdx + 1, arrowIdx).trim();
+
+        GeneratedFile importer = files.stream()
+                .filter(f -> f.getPath().equals(importerPath))
+                .findFirst()
+                .orElse(null);
+
+        if (importer == null) return null;
+
+        String content = importer.getContent();
+        // Remove the import line
+        content = content.replaceAll("(?m)^import\\s+.*ErrorBoundary.*\\n?", "");
+        // Remove JSX usage (opening and closing tags)
+        content = content.replaceAll("<ErrorBoundary[^>]*>\\s*", "");
+        content = content.replaceAll("\\s*</ErrorBoundary>", "");
+
+        log.info("✅ Removed ErrorBoundary references from {}", importerPath);
+        return GeneratedFile.builder().path(importerPath).content(content).build();
+    }
+
+    private GeneratedFile fallbackComponent(String path) {
+        return GeneratedFile.builder()
+                .path(path)
+                .content("""
+                export default function Component() {
+                  return <div>Generated fallback</div>;
+                }
+            """)
+                .build();
+    }
+
+    private String buildContext(List<GeneratedFile> files) {
+        return files.stream()
+                .limit(10)
+                .map(f -> f.getPath() + "\n" + f.getContent())
+                .collect(Collectors.joining("\n\n"));
     }
 }

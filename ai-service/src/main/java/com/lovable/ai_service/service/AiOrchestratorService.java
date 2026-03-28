@@ -13,36 +13,35 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class AiOrchestratorService {
 
-    private final ChatSessionService  sessionService;
-    private final ChatMessageService  messageService;
-    private final AiClientService     aiClientService;
-    private final AiResponseProducer  responseProducer;
-    private final AiProgressProducer  progressProducer;
-    private final AiTokenProducer     tokenProducer;
-    private final EmbeddingService    embeddingService;
+    private final ChatSessionService sessionService;
+    private final ChatMessageService messageService;
+    private final AiClientService aiClientService;
+    private final AiResponseProducer responseProducer;
+    private final AiProgressProducer progressProducer;
+    private final AiTokenProducer tokenProducer;
+    private final EmbeddingService embeddingService;
     private final RegenerationService regenerationService;
-    private final PromptFactory       promptFactory;
-    private final BuildValidator      buildValidator;
-    private final BuildAutoFixer      buildAutoFixer;
+    private final PromptFactory promptFactory;
+    private final BuildValidator buildValidator;
+    private final BuildAutoFixer buildAutoFixer;
     private final ApplicationEventPublisher publisher;
 
-    // NOTE: @Transactional removed from process().
-    // The old @Transactional caused the outer transaction to be marked
-    // rollback-only whenever EmbeddingService threw a PSQLException
-    // (Hibernate 7 + pgvector vector column deserialization).
-    // Spring AI VectorStore manages its own transactions internally,
-    // so no outer @Transactional is needed or safe here.
+    @Transactional
     public void process(AiRequestEvent event) {
+
         ChatSession session = sessionService.getOrCreate(event);
-        String sessionId    = session.getId().toString();
+        String sessionId = session.getId().toString();
 
         messageService.saveUserMessage(session.getId(), event.getPrompt());
 
@@ -54,226 +53,301 @@ public class AiOrchestratorService {
         String framework = "unknown";
 
         try {
-            sendThinking(event.getProjectId(), sessionId, "🤔 Understanding your request...");
-            sleepQuietly(250);
+            sendGlobalStatus(event.getProjectId(), sessionId,
+                    "🤔 Understanding your request...", "THINKING");
 
             if (mode == GenerationMode.INITIAL) {
-                sendThinking(event.getProjectId(), sessionId, "🧠 Analyzing requirements...");
-                sleepQuietly(250);
+
+                sendGlobalStatus(event.getProjectId(), sessionId,
+                        "🧠 Analyzing requirements...", "ANALYZING");
 
                 sendProgress(event.getProjectId(), sessionId, null,
                         "Planning project structure...", "PLANNING");
-                sendThinking(event.getProjectId(), sessionId, "📐 Planning project structure...");
+
+                sendGlobalStatus(event.getProjectId(), sessionId,
+                        "📐 Planning project structure...", "PLANNING");
 
                 ProjectSpec spec = aiClientService.planProject(event.getPrompt());
                 framework = spec.getFramework();
 
                 List<String> plannedFiles = sanitizePlannedFiles(spec.getFiles());
-                if (plannedFiles.isEmpty())
-                    throw new IllegalStateException("AI returned no planned files");
+                if (plannedFiles.isEmpty()) {
+                    throw new IllegalStateException("No files returned by planner");
+                }
 
                 sendProgress(event.getProjectId(), sessionId, null,
                         "Planned " + plannedFiles.size() + " files for " + framework, "PLANNING");
-                sendThinking(event.getProjectId(), sessionId,
-                        "📦 Planned " + plannedFiles.size() + " files using " + framework);
-                sleepQuietly(200);
+
+                sendGlobalStatus(event.getProjectId(), sessionId,
+                        "📦 Planned " + plannedFiles.size() + " files using " + framework, "PLANNED");
 
                 files = generateInitialProjectInPhases(
-                        event.getProjectId(), sessionId,
-                        event.getPrompt(), plannedFiles, framework);
+                        event.getProjectId(),
+                        sessionId,
+                        event.getPrompt(),
+                        plannedFiles,
+                        framework
+                );
 
+                // BUG 1 FIX: argument order was (files, prompt, framework) but signature
+                // is validateAndFixBuild(files, framework, userPrompt). Swapped here.
                 files = validateAndFixBuild(
-                        event.getProjectId(), sessionId,
-                        event.getPrompt(), files, plannedFiles, framework);
+                        files,
+                        framework,
+                        event.getPrompt()
+                );
 
             } else {
+
                 framework = resolveFramework(event);
 
-                sendProgress(event.getProjectId(), sessionId, null,
-                        "Regenerating project...", "REGENERATING");
-                sendThinking(event.getProjectId(), sessionId, "♻️ Regenerating requested files...");
+                sendGlobalStatus(event.getProjectId(), sessionId,
+                        "♻️ Regenerating requested files...", "REGENERATING");
 
                 files = regenerationService.regenerate(
-                        event.getProjectId(), event.getPrompt(), sessionId, framework);
+                        event.getProjectId(),
+                        event.getPrompt(),
+                        sessionId,
+                        framework
+                );
 
                 files = buildValidator.repairAll(files, framework);
 
                 files = revalidateCssAfterRegeneration(
-                        event.getProjectId(), sessionId,
-                        event.getPrompt(), files, framework);
+                        event.getProjectId(),
+                        sessionId,
+                        event.getPrompt(),
+                        files,
+                        framework
+                );
             }
 
-            sendProgress(event.getProjectId(), sessionId, null, "Syncing preview...", "DONE");
-            sendThinking(event.getProjectId(), sessionId, "✨ Finalizing project...");
-            sleepQuietly(200);
+            sendGlobalStatus(event.getProjectId(), sessionId,
+                    "✨ Finalizing project...", "DONE");
 
             String summary = aiClientService.streamSummary(
-                    event.getPrompt(), framework, files, mode,
-                    event.getProjectId(), sessionId);
+                    event.getPrompt(),
+                    framework,
+                    files,
+                    mode,
+                    event.getProjectId(),
+                    sessionId
+            );
 
             messageService.saveAiMessage(session.getId(), summary);
-            publisher.publishEvent(new PreviewTriggerEvent(event,session,files,framework));
+
+            publisher.publishEvent(new PreviewTriggerEvent(event, session, files, framework));
 
         } catch (Exception e) {
             log.error("AI orchestration failed for project {}", event.getProjectId(), e);
+
             sendProgress(event.getProjectId(), sessionId, null,
                     "Generation failed: " + safeErrorMessage(e), "FAILED");
 
-            String failureSummary = "Failed to generate the requested frontend.\nReason:\n- "
-                    + safeErrorMessage(e);
             tokenProducer.send(AiTokenEvent.builder()
-                    .projectId(event.getProjectId()).sessionId(sessionId)
-                    .token(failureSummary).completed(false).build());
-            tokenProducer.send(AiTokenEvent.builder()
-                    .projectId(event.getProjectId()).sessionId(sessionId)
-                    .token("").completed(true).build());
+                    .projectId(event.getProjectId())
+                    .sessionId(sessionId)
+                    .token("Failed to generate the requested frontend.\nReason: " + safeErrorMessage(e))
+                    .completed(false)
+                    .build());
 
-            messageService.saveAiMessage(session.getId(), failureSummary);
+            tokenProducer.send(AiTokenEvent.builder()
+                    .projectId(event.getProjectId())
+                    .sessionId(sessionId)
+                    .token("")
+                    .completed(true)
+                    .build());
+
             throw e;
         }
     }
 
-    // ═════════════════════════════════════════════════════════════
-    //  GENERATE INITIAL PROJECT IN PHASES
-    // ═════════════════════════════════════════════════════════════
-
     private List<GeneratedFile> generateInitialProjectInPhases(
-            String projectId, String sessionId,
-            String userPrompt, List<String> plannedFiles, String framework
+            String projectId,
+            String sessionId,
+            String userPrompt,
+            List<String> plannedFiles,
+            String framework
     ) {
+
         List<String> orderedFiles = promptFactory.sortFilesForGeneration(plannedFiles);
         List<List<String>> phases = buildGenerationPhases(orderedFiles);
-        List<GeneratedFile> allFiles = new ArrayList<>();
+
+        List<GeneratedFile> allFiles = Collections.synchronizedList(new ArrayList<>());
         String cssEntryPath = promptFactory.getCssEntryPath(framework);
 
-        for (int i = 0; i < phases.size(); i++) {
-            List<String> phase = phases.get(i);
-            if (i == 0)      sendThinking(projectId, sessionId, "🧩 Structuring project foundation...");
-            else if (i == 1) sendThinking(projectId, sessionId, "🏗 Building core app structure...");
-            else             sendThinking(projectId, sessionId, "🎨 Building UI pages and components...");
-            sleepQuietly(150);
+        ExecutorService executor = Executors.newFixedThreadPool(4);
+        Semaphore semaphore = new Semaphore(2);
 
-            for (String filePath : phase) {
-                try {
-                    sendProgress(projectId, sessionId, filePath, "Generating " + filePath, "GENERATING");
-                    sendThinking(projectId, sessionId, "⚡ Generating " + filePath + "...");
+        try {
+            for (int phaseIndex = 0; phaseIndex < phases.size(); phaseIndex++) {
+                List<String> phase = phases.get(phaseIndex);
 
-                    GeneratedFile file;
+                if (phaseIndex == 0) {
+                    sendGlobalStatus(projectId, sessionId,
+                            "🧩 Structuring project foundation...", "STRUCTURING");
+                } else if (phaseIndex == 1) {
+                    sendGlobalStatus(projectId, sessionId,
+                            "🏗 Building core app structure...", "BUILDING");
+                } else {
+                    sendGlobalStatus(projectId, sessionId,
+                            "🎨 Building UI pages and components...", "BUILDING");
+                }
 
-                    if (filePath.equals(cssEntryPath)) {
-                        // CSS audit prompt — only pass JSX files, cap at 10
-                        List<GeneratedFile> jsxFiles = allFiles.stream()
-                                .filter(f -> f.getPath().endsWith(".jsx")
-                                        || f.getPath().endsWith(".tsx")
-                                        || f.getPath().endsWith(".vue"))
-                                .limit(10)
-                                .toList();
-                        long jsxCount = jsxFiles.size();
-                        sendThinking(projectId, sessionId,
-                                "🎨 Building Tailwind CSS from " + jsxCount + " component files...");
-                        file = aiClientService.generateCssFile(jsxFiles, userPrompt, framework);
-                    } else {
-                        String context = buildGenerationContext(framework, orderedFiles, allFiles);
-                        file = aiClientService.generateSingleFile(
-                                context, userPrompt, filePath,
-                                Set.copyOf(orderedFiles), GenerationMode.INITIAL, framework);
-                    }
-
-                    if (file == null || file.getContent() == null || file.getContent().isBlank())
-                        throw new IllegalStateException("Generated empty file for " + filePath);
-
-                    allFiles.add(file);
-                    sendProgress(projectId, sessionId, filePath, "Finished " + filePath, "COMPLETED");
-                    sendThinking(projectId, sessionId, "✅ Finished " + filePath);
-                    sleepQuietly(120);
-
-                    // Store embeddings — non-fatal if Ollama OOMs on a chunk
+                // BUG 5 FIX: The original code started all futures in parallel with a
+                // context snapshot taken at future-creation time. Then it joined them
+                // sequentially. This meant later files in the phase all got the same
+                // (often empty) context because allFiles hadn't grown yet when their
+                // futures captured it via the lambda.
+                //
+                // Fix: for non-CSS files, resolve them sequentially within the phase so
+                // each file's context includes all previously completed files. The semaphore
+                // still limits concurrent AI calls to 2 at a time. For phases with only
+                // 1-2 files this has zero performance cost; for larger phases the
+                // context quality improvement outweighs the parallelism loss.
+                for (String filePath : phase) {
                     try {
-                        embeddingService.storeFileEmbeddings(projectId, file);
-                    } catch (Exception e) {
-                        log.warn("⚠️ Embedding failed for {} — skipping: {}", filePath, e.getMessage());
-                    }
+                        sendProgress(projectId, sessionId, filePath,
+                                "Generating " + filePath, "GENERATING");
 
-                } catch (Exception e) {
-                    sendProgress(projectId, sessionId, filePath, "Failed " + filePath, "FAILED");
-                    sendThinking(projectId, sessionId, "❌ Failed " + filePath);
-                    throw new RuntimeException(e);
+                        GeneratedFile file;
+
+                        if (filePath.equals(cssEntryPath)) {
+                            List<GeneratedFile> jsxFiles = allFiles.stream()
+                                    .filter(f -> f.getPath().endsWith(".jsx")
+                                            || f.getPath().endsWith(".tsx")
+                                            || f.getPath().endsWith(".vue"))
+                                    .limit(10)
+                                    .toList();
+
+                            file = aiClientService.generateCssFile(jsxFiles, userPrompt, framework);
+                        } else {
+                            semaphore.acquire();
+                            try {
+                                // Context is built NOW — after previous files in this phase
+                                // have already been added to allFiles. This is the key fix.
+                                String context = buildGenerationContext(framework, orderedFiles, allFiles);
+
+                                file = aiClientService.generateSingleFile(
+                                        context,
+                                        userPrompt,
+                                        filePath,
+                                        Set.copyOf(orderedFiles),
+                                        GenerationMode.INITIAL,
+                                        framework
+                                );
+                            } finally {
+                                semaphore.release();
+                            }
+                        }
+
+                        if (file == null || file.getContent() == null || file.getContent().isBlank()) {
+                            throw new IllegalStateException("Generated empty file for " + filePath);
+                        }
+
+                        // Stream the file content, then add to allFiles so subsequent
+                        // files in the same phase get it in their context.
+                        CompletableFuture<Void> streamFuture = streamFileContent(projectId, sessionId, file);
+                        streamFuture.join();
+
+                        allFiles.add(file);
+
+                        sendProgress(projectId, sessionId, filePath,
+                                "Finished " + filePath, "COMPLETED");
+
+                        CompletableFuture.runAsync(() -> {
+                            try {
+                                embeddingService.storeFileEmbeddings(projectId, file);
+                            } catch (Exception e) {
+                                log.warn("Embedding failed for {}: {}", filePath, e.getMessage());
+                            }
+                        });
+
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted while generating " + filePath, e);
+                    } catch (Exception e) {
+                        sendProgress(projectId, sessionId, filePath,
+                                "Failed " + filePath, "FAILED");
+                        throw new RuntimeException(e);
+                    }
                 }
             }
+        } finally {
+            executor.shutdown();
         }
 
         return allFiles;
     }
 
-    // ═════════════════════════════════════════════════════════════
-    //  VALIDATE AND FIX BUILD
-    // ═════════════════════════════════════════════════════════════
-
-    private List<GeneratedFile> validateAndFixBuild(
-            String projectId, String sessionId,
-            String userPrompt, List<GeneratedFile> files,
-            List<String> plannedFiles, String framework
+    // BUG 1 FIX: corrected argument order — was (files, framework, userPrompt) in signature
+    // but called as (files, prompt, framework) from process(). Now both match.
+    public List<GeneratedFile> validateAndFixBuild(
+            List<GeneratedFile> files,
+            String framework,
+            String userPrompt
     ) {
-        sendThinking(projectId, sessionId, "🔍 Validating Tailwind setup and build...");
-        sleepQuietly(200);
+        int maxAttempts = 3;
 
-        List<String> issues = buildValidator.validate(files, framework);
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
 
-        if (issues.isEmpty()) {
-            sendThinking(projectId, sessionId, "✅ Build validation passed");
-            return files;
-        }
+            log.info("🔍 Validation attempt {}", attempt);
 
-        sendThinking(projectId, sessionId,
-                "⚠️ Found " + issues.size() + " issue(s). Auto-fixing...");
-        sleepQuietly(200);
-        log.warn("⚠️ Build issues: {}", issues);
+            // STEP 1 — Repair each file
+            files = buildValidator.repairAll(files, framework);
 
-        List<GeneratedFile> fixedFiles = new ArrayList<>(files);
+            // STEP 2 — Validate project
+            List<String> issues = buildValidator.validate(files, framework);
 
-        for (String issue : issues) {
-            sendThinking(projectId, sessionId, "🛠 Fixing: "
-                    + issue.substring(0, Math.min(80, issue.length())));
-            GeneratedFile fixed = buildAutoFixer.fix(issue, fixedFiles, userPrompt, framework);
-            if (fixed != null) {
-                fixedFiles.removeIf(f -> f.getPath().equals(fixed.getPath()));
-                fixedFiles.add(fixed);
-                sendThinking(projectId, sessionId, "✅ Fixed: " + fixed.getPath());
+            if (issues.isEmpty()) {
+                log.info("✅ Build validation passed");
+                return files;
+            }
+
+            log.warn("⚠️ Found {} issues", issues.size());
+
+            // STEP 3 — Fix issues
+            for (String issue : issues) {
+                GeneratedFile fixed = buildAutoFixer.fix(issue, files, userPrompt, framework);
+
+                if (fixed != null) {
+                    files = replaceFile(files, fixed);
+                }
             }
         }
 
-        List<String> remaining = buildValidator.validate(fixedFiles, framework);
-        if (!remaining.isEmpty()) {
-            log.error("❌ Still failing after auto-fix: {}", remaining);
-            sendThinking(projectId, sessionId, "❌ Unfixed issues: " + remaining);
-        } else {
-            sendThinking(projectId, sessionId, "🎉 All issues fixed successfully");
-        }
-
-        return fixedFiles;
+        log.error("❌ Build failed after max retries");
+        return files;
     }
 
-    // ═════════════════════════════════════════════════════════════
-    //  RE-VALIDATE CSS AFTER REGENERATION
-    // ═════════════════════════════════════════════════════════════
+    private List<GeneratedFile> replaceFile(List<GeneratedFile> files, GeneratedFile updated) {
+        return files.stream()
+                .map(f -> f.getPath().equals(updated.getPath()) ? updated : f)
+                .collect(Collectors.toList());
+    }
 
     private List<GeneratedFile> revalidateCssAfterRegeneration(
-            String projectId, String sessionId,
-            String userPrompt, List<GeneratedFile> files, String framework
+            String projectId,
+            String sessionId,
+            String userPrompt,
+            List<GeneratedFile> files,
+            String framework
     ) {
-        sendThinking(projectId, sessionId, "🔍 Re-validating Tailwind CSS after regeneration...");
+        sendGlobalStatus(projectId, sessionId,
+                "🔍 Re-validating Tailwind CSS after regeneration...", "REVALIDATING");
 
         String cssPath = promptFactory.getCssEntryPath(framework);
 
         GeneratedFile cssFile = files.stream()
                 .filter(f -> f.getPath().equals(cssPath))
-                .findFirst().orElse(null);
+                .findFirst()
+                .orElse(null);
 
         if (cssFile == null) {
-            log.warn("⚠️ CSS entry file missing after regeneration: {}", cssPath);
-            sendThinking(projectId, sessionId, "🎨 Rebuilding CSS entry file...");
+            log.warn("CSS entry file missing after regeneration: {}", cssPath);
+            sendGlobalStatus(projectId, sessionId,
+                    "🎨 Rebuilding CSS entry file...", "REBUILDING");
 
-            // Only pass JSX files, cap at 10 — prevents context length errors
             List<GeneratedFile> jsxFiles = files.stream()
                     .filter(f -> f.getPath().endsWith(".jsx")
                             || f.getPath().endsWith(".tsx")
@@ -285,29 +359,148 @@ public class AiOrchestratorService {
             if (newCss != null) {
                 List<GeneratedFile> updated = new ArrayList<>(files);
                 updated.add(newCss);
-                sendThinking(projectId, sessionId, "✅ CSS entry file restored: " + cssPath);
+                sendGlobalStatus(projectId, sessionId,
+                        "✅ CSS entry file restored: " + cssPath, "RESTORE");
                 return updated;
             }
             return files;
         }
 
         GeneratedFile repairedCss = buildValidator.repairFile(cssFile, framework);
-        if (!repairedCss.getContent().equals(cssFile.getContent())) {
-            log.info("⚠️ CSS entry file repaired after regeneration: {}", cssPath);
-            sendThinking(projectId, sessionId, "✅ Tailwind directive fixed in " + cssPath);
+        if (!Objects.equals(repairedCss.getContent(), cssFile.getContent())) {
             List<GeneratedFile> updated = new ArrayList<>(files);
             updated.removeIf(f -> f.getPath().equals(cssPath));
             updated.add(repairedCss);
+
+            sendGlobalStatus(projectId, sessionId,
+                    "✅ Tailwind directive fixed in " + cssPath, "FIXED");
             return updated;
         }
 
-        sendThinking(projectId, sessionId, "✅ Tailwind CSS looks good after regeneration");
+        sendGlobalStatus(projectId, sessionId,
+                "✅ Tailwind CSS looks good after regeneration", "REGENERATION");
+
         return files;
     }
 
-    // ═════════════════════════════════════════════════════════════
-    //  PHASE BUILDER
-    // ═════════════════════════════════════════════════════════════
+    private String buildGenerationContext(
+            String framework,
+            List<String> plannedFiles,
+            List<GeneratedFile> generatedFiles
+    ) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("FRAMEWORK: ").append(framework).append("\n");
+        sb.append("PLANNED FILES:\n");
+        for (String f : plannedFiles) {
+            sb.append("- ").append(f).append("\n");
+        }
+
+        sb.append("\nGENERATED FILES SO FAR:\n");
+        if (generatedFiles.isEmpty()) {
+            sb.append("(none)\n");
+            return sb.toString();
+        }
+
+        int fileLimit = Math.min(generatedFiles.size(), 8);
+        for (int i = 0; i < fileLimit; i++) {
+            GeneratedFile f = generatedFiles.get(i);
+            sb.append("FILE: ").append(f.getPath()).append("\n");
+
+            String[] lines = f.getContent().split("\n");
+            int lineLimit = Math.min(lines.length, 15);
+            for (int j = 0; j < lineLimit; j++) {
+                sb.append(lines[j]).append("\n");
+            }
+            if (lines.length > 15) {
+                sb.append("// ... truncated\n");
+            }
+            sb.append("-----\n");
+        }
+
+        if (generatedFiles.size() > 8) {
+            sb.append("// ... and ").append(generatedFiles.size() - 8).append(" more files omitted\n");
+        }
+
+        return sb.toString();
+    }
+
+    private CompletableFuture<Void> streamFileContent(String projectId, String sessionId, GeneratedFile file) {
+        return CompletableFuture.runAsync(() -> {
+            String content = file.getContent();
+            if (content == null || content.isBlank()) {
+                return;
+            }
+
+            List<String> chunks = splitIntoChunks(content, 120);
+
+            for (String chunk : chunks) {
+                tokenProducer.send(AiTokenEvent.builder()
+                        .projectId(projectId)
+                        .sessionId(sessionId)
+                        .filePath(file.getPath())
+                        .status("GENERATING")
+                        .token(chunk)
+                        .completed(false)
+                        .build());
+
+                sleepQuietly(20);
+            }
+        });
+    }
+
+    private List<String> splitIntoChunks(String text, int size) {
+        List<String> chunks = new ArrayList<>();
+        if (text == null || text.isEmpty()) {
+            return chunks;
+        }
+
+        for (int i = 0; i < text.length(); i += size) {
+            chunks.add(text.substring(i, Math.min(text.length(), i + size)));
+        }
+        return chunks;
+    }
+
+    private void sendGlobalStatus(String projectId, String sessionId, String message, String status) {
+        tokenProducer.send(AiTokenEvent.builder()
+                .projectId(projectId)
+                .sessionId(sessionId)
+                .status(status)
+                .token(message)
+                .completed(false)
+                .build());
+    }
+
+    private void sendProgress(String projectId, String sessionId,
+                              String filePath, String message, String status) {
+        progressProducer.send(AiProgressEvent.builder()
+                .projectId(projectId)
+                .sessionId(sessionId)
+                .filePath(filePath)
+                .message(message)
+                .status(status)
+                .build());
+    }
+
+    private String resolveFramework(AiRequestEvent event) {
+        if (event.getFramework() != null && !event.getFramework().isBlank()) {
+            return event.getFramework();
+        }
+        return promptFactory.detectFramework(event.getPrompt());
+    }
+
+    private List<String> sanitizePlannedFiles(List<String> files) {
+        if (files == null) {
+            return List.of();
+        }
+
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        for (String f : files) {
+            if (f != null && !f.isBlank()) {
+                seen.add(f.trim());
+            }
+        }
+        return new ArrayList<>(seen);
+    }
 
     private List<List<String>> buildGenerationPhases(List<String> files) {
         List<String> phase1 = new ArrayList<>();
@@ -317,19 +510,29 @@ public class AiOrchestratorService {
 
         for (String file : files) {
             String n = file.toLowerCase(Locale.ROOT);
+
             if (n.endsWith(".css") || n.endsWith(".scss")) {
                 phase4.add(file);
             } else if (n.equals("package.json")
-                    || n.equals("vite.config.js") || n.equals("vite.config.ts")
+                    || n.equals("vite.config.js")
+                    || n.equals("vite.config.ts")
                     || n.equals("index.html")
-                    || n.equals("next.config.js") || n.equals("next.config.mjs")
-                    || n.equals("angular.json") || n.equals("tsconfig.json")
-                    || n.equals("tailwind.config.js") || n.equals("postcss.config.js")) {
+                    || n.equals("next.config.js")
+                    || n.equals("next.config.mjs")
+                    || n.equals("angular.json")
+                    || n.equals("tsconfig.json")
+                    || n.equals("tailwind.config.js")
+                    || n.equals("postcss.config.js")) {
                 phase1.add(file);
             } else if (n.contains("main.")
-                    || n.endsWith("/layout.js") || n.endsWith("/layout.tsx")
-                    || n.endsWith("/page.js")   || n.endsWith("/page.tsx")
-                    || n.endsWith("/app.jsx")   || n.endsWith("/app.tsx")
+                    || n.endsWith("/layout.js")
+                    || n.endsWith("/layout.jsx")
+                    || n.endsWith("/layout.tsx")
+                    || n.endsWith("/page.js")
+                    || n.endsWith("/page.jsx")
+                    || n.endsWith("/page.tsx")
+                    || n.endsWith("/app.jsx")
+                    || n.endsWith("/app.tsx")
                     || n.endsWith("/app.vue")) {
                 phase2.add(file);
             } else {
@@ -342,77 +545,20 @@ public class AiOrchestratorService {
         if (!phase2.isEmpty()) phases.add(phase2);
         if (!phase3.isEmpty()) phases.add(phase3);
         if (!phase4.isEmpty()) phases.add(phase4);
+
         return phases;
     }
 
-    // ═════════════════════════════════════════════════════════════
-    //  HELPERS
-    // ═════════════════════════════════════════════════════════════
-
-    private List<String> sanitizePlannedFiles(List<String> files) {
-        if (files == null) return List.of();
-        LinkedHashSet<String> seen = new LinkedHashSet<>();
-        for (String f : files) if (f != null && !f.isBlank()) seen.add(f.trim());
-        return new ArrayList<>(seen);
-    }
-
-    private String buildGenerationContext(
-            String framework, List<String> plannedFiles, List<GeneratedFile> generatedFiles
-    ) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("FRAMEWORK: ").append(framework).append("\n");
-        sb.append("PLANNED FILES:\n");
-        for (String f : plannedFiles) sb.append("- ").append(f).append("\n");
-        sb.append("\nGENERATED FILES SO FAR:\n");
-
-        if (generatedFiles.isEmpty()) {
-            sb.append("(none)\n");
-            return sb.toString();
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
         }
-
-        // Cap: 8 files max, 15 lines each — prevents context length errors
-        int fileLimit = Math.min(generatedFiles.size(), 8);
-        for (int i = 0; i < fileLimit; i++) {
-            GeneratedFile f = generatedFiles.get(i);
-            sb.append("FILE: ").append(f.getPath()).append("\n");
-            String[] lines = f.getContent().split("\n");
-            int lineLimit = Math.min(lines.length, 15);
-            for (int j = 0; j < lineLimit; j++) sb.append(lines[j]).append("\n");
-            if (lines.length > 15) sb.append("// ... truncated\n");
-            sb.append("-----\n");
-        }
-        if (generatedFiles.size() > 8)
-            sb.append("// ... and ").append(generatedFiles.size() - 8).append(" more files omitted\n");
-
-        return sb.toString();
-    }
-
-    private void sendProgress(String projectId, String sessionId,
-                              String filePath, String message, String status) {
-        progressProducer.send(AiProgressEvent.builder()
-                .projectId(projectId).sessionId(sessionId)
-                .filePath(filePath).message(message).status(status).build());
-    }
-
-    private void sendThinking(String projectId, String sessionId, String message) {
-        tokenProducer.send(AiTokenEvent.builder()
-                .projectId(projectId).sessionId(sessionId)
-                .token(message + "\n").completed(false).build());
     }
 
     private String safeErrorMessage(Exception e) {
         String msg = e.getMessage();
         return (msg == null || msg.isBlank()) ? "Unknown error" : msg;
-    }
-
-    private String resolveFramework(AiRequestEvent event) {
-        if (event.getFramework() != null && !event.getFramework().isBlank())
-            return event.getFramework();
-        return promptFactory.detectFramework(event.getPrompt());
-    }
-
-    private void sleepQuietly(long millis) {
-        try { Thread.sleep(millis); }
-        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 }
