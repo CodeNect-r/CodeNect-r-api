@@ -2,7 +2,7 @@ package com.lovable.ai_service.service;
 
 import com.lovable.ai_service.dto.*;
 import com.lovable.ai_service.entity.ChatSession;
-import com.lovable.ai_service.event.PreviewTriggerEvent;
+import com.lovable.ai_service.producer.AiPartialProducer;
 import com.lovable.ai_service.producer.AiProgressProducer;
 import com.lovable.ai_service.producer.AiResponseProducer;
 import com.lovable.ai_service.producer.AiTokenProducer;
@@ -27,7 +27,6 @@ public class AiOrchestratorService {
     private final ChatSessionService sessionService;
     private final ChatMessageService messageService;
     private final AiClientService aiClientService;
-    private final AiResponseProducer responseProducer;
     private final AiProgressProducer progressProducer;
     private final AiTokenProducer tokenProducer;
     private final EmbeddingService embeddingService;
@@ -35,8 +34,8 @@ public class AiOrchestratorService {
     private final PromptFactory promptFactory;
     private final BuildValidator buildValidator;
     private final BuildAutoFixer buildAutoFixer;
-    private final ApplicationEventPublisher publisher;
-
+    private final AiResponseProducer producer;
+    private final AiPartialProducer aiPartialProducer;
     @Transactional
     public void process(AiRequestEvent event) {
 
@@ -44,6 +43,7 @@ public class AiOrchestratorService {
         String sessionId = session.getId().toString();
 
         messageService.saveUserMessage(session.getId(), event.getPrompt());
+
 
         GenerationMode mode = "INITIAL_PROJECT".equals(event.getOperationType())
                 ? GenerationMode.INITIAL
@@ -86,7 +86,8 @@ public class AiOrchestratorService {
                         sessionId,
                         event.getPrompt(),
                         plannedFiles,
-                        framework
+                        framework,
+                        event
                 );
 
                 // BUG 1 FIX: argument order was (files, prompt, framework) but signature
@@ -135,8 +136,8 @@ public class AiOrchestratorService {
             );
 
             messageService.saveAiMessage(session.getId(), summary);
+            producer.sendResponse(event, session, files, framework);
 
-            publisher.publishEvent(new PreviewTriggerEvent(event, session, files, framework));
 
         } catch (Exception e) {
             log.error("AI orchestration failed for project {}", event.getProjectId(), e);
@@ -158,6 +159,7 @@ public class AiOrchestratorService {
                     .completed(true)
                     .build());
 
+
             throw e;
         }
     }
@@ -167,7 +169,8 @@ public class AiOrchestratorService {
             String sessionId,
             String userPrompt,
             List<String> plannedFiles,
-            String framework
+            String framework,
+            AiRequestEvent event
     ) {
 
         List<String> orderedFiles = promptFactory.sortFilesForGeneration(plannedFiles);
@@ -251,6 +254,16 @@ public class AiOrchestratorService {
                         streamFuture.join();
 
                         allFiles.add(file);
+                        aiPartialProducer.send(
+                                AiPartialEvent.builder()
+                                        .projectId(projectId)
+                                        .sessionId(sessionId)
+                                        .filePath(file.getPath())
+                                        .content(file.getContent())
+                                        .snapshotId(event.getSnapshotId())
+                                        .snapshotTime(event.getSnapshotTime())
+                                        .build()
+                        );
 
                         sendProgress(projectId, sessionId, filePath,
                                 "Finished " + filePath, "COMPLETED");

@@ -17,4 +17,7 @@ public class AiRequestEvent {
     private String prompt;
     private String framework;
     private String operationType;
+    private String snapshotId;
+    private long snapshotTime;
+    private String parentSnapshotId;
 }

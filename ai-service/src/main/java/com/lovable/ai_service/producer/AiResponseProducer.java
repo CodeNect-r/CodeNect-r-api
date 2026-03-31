@@ -1,5 +1,6 @@
 package com.lovable.ai_service.producer;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lovable.ai_service.dto.AiRequestEvent;
 import com.lovable.ai_service.dto.AiResponseEvent;
 import com.lovable.ai_service.dto.GeneratedFile;
@@ -14,7 +15,8 @@ import java.util.List;
 @RequiredArgsConstructor
 public class AiResponseProducer {
 
-    private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ObjectMapper objectMapper;
 
     public void sendResponse(
             AiRequestEvent event,
@@ -23,14 +25,25 @@ public class AiResponseProducer {
             String framework
     ) {
 
-        AiResponseEvent response = new AiResponseEvent();
+        try {
+            AiResponseEvent response = new AiResponseEvent();
 
-        response.setProjectId(event.getProjectId());
-        response.setSessionId(session.getId().toString());
-        response.setFiles(files);
-        response.setStatus("COMPLETED");
-        response.setFramework(framework);
+            response.setProjectId(event.getProjectId());
+            response.setSessionId(session.getId().toString());
+            response.setFiles(files);
+            response.setSnapshotId(event.getSnapshotId());
+            response.setSnapshotTime(event.getSnapshotTime());
+            response.setStatus("COMPLETED");
+            response.setFramework(framework);
 
-        kafkaTemplate.send("ai.response", response);
+            kafkaTemplate.send(
+                    "ai.response",
+                    event.getProjectId(),
+                    objectMapper.writeValueAsString(response)
+            );
+
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 }

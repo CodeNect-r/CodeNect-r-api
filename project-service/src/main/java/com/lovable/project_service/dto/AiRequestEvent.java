@@ -18,4 +18,8 @@ public class AiRequestEvent {
     private String framework;
 
     private OperationType operationType; // CREATE_PROJECT | MODIFY_FILE
+
+    private String snapshotId;
+    private long snapshotTime;
+    private String parentSnapshotId;
 }

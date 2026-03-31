@@ -8,7 +8,7 @@ import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "project_files",
-        indexes = @Index(name = "idx_project_path", columnList = "projectId,path"))
+        indexes = @Index(name = "idx_project_path", columnList = "projectId,filePath"))
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
@@ -24,6 +24,7 @@ public class ProjectFile {
 
     @Column(nullable = false)
     private String filePath;
+
     private int currentVersion;
 
 

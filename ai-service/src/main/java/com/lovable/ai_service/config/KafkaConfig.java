@@ -32,8 +32,7 @@ public class KafkaConfig {
     @Bean
     public ConcurrentKafkaListenerContainerFactory<Object, Object> kafkaListenerContainerFactory(
             org.springframework.kafka.core.ConsumerFactory<Object, Object> consumerFactory,
-            DefaultErrorHandler errorHandler,
-            RecordMessageConverter converter // 1. Inject the converter here
+            DefaultErrorHandler errorHandler
     ) {
 
         ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
@@ -43,14 +42,9 @@ public class KafkaConfig {
         factory.setCommonErrorHandler(errorHandler);
 
         // 2. Attach the converter to the factory so payloads map correctly!
-        factory.setRecordMessageConverter(converter);
 
         return factory;
     }
 
-    @Bean
-    public RecordMessageConverter converter() {
-        // 3. Define the modern Jackson 3 converter bean
-        return new StringJacksonJsonMessageConverter();
-    }
+
 }

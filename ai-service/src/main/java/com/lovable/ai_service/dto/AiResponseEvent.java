@@ -13,8 +13,10 @@ public class AiResponseEvent {
 
     private String projectId;
     private String sessionId;
-
+    private String snapshotId;
+    private long snapshotTime;
     private List<GeneratedFile> files;
     private String framework;
     private String status;
+
 }
