@@ -1,28 +1,20 @@
-package com.lovable.preview_service.dto;
+package com.lovable.project_service.dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-import java.util.List;
-
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class AiResponseEvent {
-
-    private String eventId;
-    private String eventVersion;
-
+public class AiPartialEvent {
     private String projectId;
     private String sessionId;
+    private String filePath;
+    private String content;
 
     private String snapshotId;
     private long snapshotTime;
-
-    private String framework;
-    private String status;
-    private List<Object> files;
 }

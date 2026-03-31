@@ -1,5 +1,6 @@
 package com.lovable.ai_service.consumer;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lovable.ai_service.dto.AiRequestEvent;
 import com.lovable.ai_service.service.AiOrchestratorService;
 import lombok.RequiredArgsConstructor;
@@ -21,13 +22,15 @@ public class AiRequestConsumer {
     private final ExecutorService executor = Executors.newFixedThreadPool(5);
 
     @KafkaListener(topics = "ai.request", groupId = "ai-service-group-v4")
-    public void consume(AiRequestEvent event) {
-
-        log.info("Message Received: {}", event.getPrompt());
+    public void consume(String message) {
 
         executor.submit(() -> {
             try {
+                AiRequestEvent event =
+                        new ObjectMapper().readValue(message, AiRequestEvent.class);
+
                 orchestrator.process(event);
+
             } catch (Exception e) {
                 log.error("AI processing failed", e);
             }

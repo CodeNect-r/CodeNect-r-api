@@ -35,6 +35,9 @@ public class Project {
     private String status;
     // PROCESSING | READY | FAILED
 
+    @Column(name = "latest_snapshot_id")
+    private String latestSnapshotId;
+
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

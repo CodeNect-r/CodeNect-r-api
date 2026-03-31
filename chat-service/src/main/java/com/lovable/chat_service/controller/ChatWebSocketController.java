@@ -40,37 +40,7 @@ public class ChatWebSocketController {
         System.out.println("PROMPT RECEIVED: " + request.getPrompt());
 
         // FIRST PROMPT → create project only
-        if (projectId == null || projectId.isBlank()) {
-
-            String requestId = (request.getRequestId() != null && !request.getRequestId().isBlank())
-                    ? request.getRequestId()
-                    : UUID.randomUUID().toString();
-
-            CompletableFuture<ProjectCreatedEvent> future = replyHandler.register(requestId);
-
-            CreateProjectEvent createEvent = CreateProjectEvent.builder()
-                    .requestId(requestId)
-                    .userEmail(userEmail)
-                    .name(generateProjectName(request.getPrompt()))
-                    .description(request.getPrompt())
-                    .build();
-
-            projectCreateProducer.send(createEvent);
-
-            ProjectCreatedEvent createdEvent = future.get(15, TimeUnit.SECONDS);
-
-            messagingTemplate.convertAndSendToUser(
-                    userEmail,
-                    "/queue/project-created",
-                    createdEvent
-            );
-
-            // DO NOT send ai.request here
-            // project-service will send it
-
-            return;
-        }
-
+//
         // EXISTING PROJECT → modify through AI
 
         AiRequestEvent aiRequest = AiRequestEvent.builder()

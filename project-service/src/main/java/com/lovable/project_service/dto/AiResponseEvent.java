@@ -7,6 +7,7 @@ import java.util.List;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
+@Builder
 public class AiResponseEvent {
 
     private String eventId;
@@ -17,6 +18,7 @@ public class AiResponseEvent {
 
     private List<GeneratedFile> files;
     private String framework;
-
+    private String snapshotId;
+    private long snapshotTime;
     private String status;
 }

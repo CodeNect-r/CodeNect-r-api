@@ -27,6 +27,12 @@ public class PreviewInstance {
 
     private String status;
     // BUILDING / RUNNING / STOPPED / FAILED
+    private String currentSnapshotId;
+
+    private Long currentSnapshotTime;
+
+    @Enumerated(EnumType.STRING)
+    private ProjectType currentProjectType;
 
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;

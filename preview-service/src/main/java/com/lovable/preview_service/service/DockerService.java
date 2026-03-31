@@ -1,11 +1,13 @@
 package com.lovable.preview_service.service;
 
+import com.lovable.preview_service.entity.ProjectType;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 import java.util.stream.Collectors;
 
@@ -22,9 +24,7 @@ public class DockerService {
     }
 
     public void ensureNetworkExists() throws Exception {
-        ProcessBuilder checkPb = new ProcessBuilder(
-                "docker", "network", "inspect", previewNetwork
-        );
+        ProcessBuilder checkPb = new ProcessBuilder("docker", "network", "inspect", previewNetwork);
         checkPb.redirectErrorStream(true);
 
         Process checkProcess = checkPb.start();
@@ -34,9 +34,7 @@ public class DockerService {
             return;
         }
 
-        ProcessBuilder createPb = new ProcessBuilder(
-                "docker", "network", "create", previewNetwork
-        );
+        ProcessBuilder createPb = new ProcessBuilder("docker", "network", "create", previewNetwork);
         createPb.redirectErrorStream(true);
 
         Process createProcess = createPb.start();
@@ -71,7 +69,7 @@ public class DockerService {
         return tag;
     }
 
-    public String runContainer(String projectId, String imageTag,String containerName) throws Exception {
+    public String runContainer(String projectId, String imageTag, String containerName) throws Exception {
         ensureNetworkExists();
 
         removeContainerIfExists(projectId, containerName);
@@ -138,9 +136,7 @@ public class DockerService {
     }
 
     public void stopContainer(String projectId, String containerId) throws Exception {
-        if (containerId == null || containerId.isBlank()) {
-            return;
-        }
+        if (containerId == null || containerId.isBlank()) return;
 
         ProcessBuilder pb = new ProcessBuilder("docker", "stop", containerId);
         pb.redirectErrorStream(true);
@@ -153,9 +149,7 @@ public class DockerService {
     }
 
     public void removeContainer(String projectId, String containerId) throws Exception {
-        if (containerId == null || containerId.isBlank()) {
-            return;
-        }
+        if (containerId == null || containerId.isBlank()) return;
 
         ProcessBuilder pb = new ProcessBuilder("docker", "rm", "-f", containerId);
         pb.redirectErrorStream(true);
@@ -191,11 +185,66 @@ public class DockerService {
         }
     }
 
-    public void copyFilesToContainer(String projectId, String containerId, Path projectDir) throws Exception {
+    public void syncIncrementalFiles(String projectId,
+                                     String containerId,
+                                     String containerName,
+                                     Path workspaceDir,
+                                     List<String> changedPaths,
+                                     List<String> deletedPaths,
+                                     ProjectType projectType) throws Exception {
+
+        String targetRoot = switch (projectType) {
+            case STATIC -> "/usr/share/nginx/html";
+            case NODE -> "/app";
+            default -> throw new IllegalStateException("Incremental sync not supported for " + projectType);
+        };
+
+        for (String path : changedPaths) {
+            Path localFile = workspaceDir.resolve(path);
+            String normalized = path.replace("\\", "/");
+            String targetPath = targetRoot + "/" + normalized;
+            String parentDir = targetPath.substring(0, targetPath.lastIndexOf('/'));
+
+            ensureDirectoryInContainer(projectId, containerName, parentDir);
+            copySingleFileToContainer(projectId, containerId, localFile, targetPath);
+        }
+
+        for (String path : deletedPaths) {
+            String normalized = path.replace("\\", "/");
+            deleteFileInContainer(projectId, containerName, targetRoot + "/" + normalized);
+        }
+
+        if (projectType == ProjectType.NODE) {
+            restartContainer(projectId, containerName);
+        }
+    }
+
+    public void ensureDirectoryInContainer(String projectId, String containerName, String dir) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "docker", "exec", containerName,
+                "sh", "-c", "mkdir -p \"" + dir + "\""
+        );
+        pb.redirectErrorStream(true);
+
+        Process process = pb.start();
+        String output = readProcessOutput(process, line ->
+                previewLogService.append(projectId, "[MKDIR] " + line)
+        );
+
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            throw new RuntimeException("Failed to create dir in container: " + output);
+        }
+    }
+
+    public void copySingleFileToContainer(String projectId,
+                                          String containerId,
+                                          Path localFile,
+                                          String targetPath) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
                 "docker", "cp",
-                projectDir.toAbsolutePath() + "/.",
-                containerId + ":/app"
+                localFile.toAbsolutePath().toString(),
+                containerId + ":" + targetPath
         );
         pb.redirectErrorStream(true);
 
@@ -206,7 +255,68 @@ public class DockerService {
 
         int exitCode = process.waitFor();
         if (exitCode != 0) {
-            throw new RuntimeException("Failed to copy files to container: " + output);
+            throw new RuntimeException("Failed to copy file to container: " + output);
+        }
+    }
+
+    public void copyFileIntoContainer(
+            String projectId,
+            String containerId,
+            String containerName,
+            String filePath,
+            String content,
+            String targetPath
+    ) throws Exception {
+
+        Path localPath = Path.of("/tmp/previews/" + projectId + "/" + filePath);
+
+        java.nio.file.Files.createDirectories(localPath.getParent());
+        java.nio.file.Files.writeString(localPath, content);
+
+        previewLogService.append(projectId, "[WRITE] " + filePath);
+
+        String parentDir = targetPath.substring(0, targetPath.lastIndexOf('/'));
+
+        ensureDirectoryInContainer(projectId, containerName, parentDir);
+
+        copySingleFileToContainer(
+                projectId,
+                containerId,
+                localPath,
+                targetPath
+        );
+    }
+
+    public void deleteFileInContainer(String projectId, String containerName, String targetPath) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "docker", "exec", containerName,
+                "sh", "-c", "rm -f \"" + targetPath + "\""
+        );
+        pb.redirectErrorStream(true);
+
+        Process process = pb.start();
+        String output = readProcessOutput(process, line ->
+                previewLogService.append(projectId, "[DELETE] " + line)
+        );
+
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            throw new RuntimeException("Failed to delete file in container: " + output);
+        }
+    }
+
+    public void restartContainer(String projectId, String containerName) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder("docker", "restart", containerName);
+        pb.redirectErrorStream(true);
+
+        Process process = pb.start();
+        String output = readProcessOutput(process, line ->
+                previewLogService.append(projectId, "[RESTART] " + line)
+        );
+
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            throw new RuntimeException("Failed to restart container: " + output);
         }
     }
 

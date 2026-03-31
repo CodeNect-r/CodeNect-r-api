@@ -4,6 +4,7 @@ import com.lovable.preview_service.dto.PreviewStatusResponse;
 import com.lovable.preview_service.entity.PreviewLog;
 import com.lovable.preview_service.service.PreviewLogService;
 import com.lovable.preview_service.service.PreviewOrchestratorService;
+import com.lovable.preview_service.service.PreviewStreamBufferService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
@@ -19,6 +20,7 @@ public class PreviewController {
 
     @PostMapping("/{projectId}/start")
     public PreviewStatusResponse start(@PathVariable String projectId) throws Exception {
+
         previewOrchestratorService.startPreview(projectId);
         return previewOrchestratorService.getPreviewStatus(projectId);
     }

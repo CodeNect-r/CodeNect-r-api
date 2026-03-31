@@ -45,6 +45,15 @@ public class ProjectController {
         accessService.getOwnedProject(projectId, auth);
         return projectService.getProjectFiles(projectId);
     }
+    @GetMapping("/{projectId}/snapshots/{snapshotId}/files")
+    public List<ProjectFileResponse> getSnapshotFiles(
+            @PathVariable String projectId,
+            @PathVariable String snapshotId,
+            Authentication auth
+    ) {
+        accessService.getOwnedProject(projectId, auth);
+        return projectService.getSnapshotFiles(projectId, snapshotId);
+    }
 
     @GetMapping("/{projectId}/files/tree")
     public List<FileNodeResponse> getFileTree(@PathVariable String projectId, Authentication auth) {
