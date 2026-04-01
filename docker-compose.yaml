@@ -124,4 +124,4 @@ volumes:
 
 networks:
   lovable-network:
-    driver: bridge
+    driver: bridge   
