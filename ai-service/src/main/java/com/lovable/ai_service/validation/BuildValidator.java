@@ -3,7 +3,7 @@ package com.lovable.ai_service.validation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lovable.ai_service.dto.GeneratedFile;
-import com.lovable.ai_service.service.PromptFactory;
+import com.lovable.ai_service.prompt.PromptFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -20,6 +20,7 @@ public class BuildValidator {
 
     private final ChatClient chatClient;
     private final PromptFactory promptFactory;
+    private final ComponentStructureRepairService componentStructureRepairService;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -61,8 +62,7 @@ public class BuildValidator {
             content = fixUnclosedJsx(content);
             content = fixUndefinedVariables(content);
             content = fixMissingExport(content);
-            content = fixDuplicateComponentDeclaration(content);
-            content = fixDuplicateDefaultExport(content);
+            content = componentStructureRepairService.fixDuplicateComponentDeclaration(content);
         }
 
         if (needsAiRepair(content, path)) {
@@ -90,37 +90,6 @@ public class BuildValidator {
      * the line-scan approach is replaced with a regex that matches only declaration
      * forms, not inline expressions.
      */
-    String fixDuplicateDefaultExport(String content) {
-        if (content == null) return content;
-
-        // Count only declaration-style default exports, not re-exports or expressions
-        Pattern declPattern = Pattern.compile(
-                "(?m)^export\\s+default\\s+(?:function|class)\\s+");
-        long count = declPattern.matcher(content).results().count();
-
-        if (count <= 1) return content;
-
-        log.warn("[BuildValidator] Removing duplicate export default declaration ({} found)", count);
-
-        // Keep only the first declaration; remove subsequent ones by replacing
-        // the duplicate declaration keyword with just "function"/"class" (unexported).
-        // This preserves the function body — it just removes the extra export default.
-        Matcher m = declPattern.matcher(content);
-        boolean firstFound = false;
-        StringBuffer sb = new StringBuffer();
-        while (m.find()) {
-            if (!firstFound) {
-                firstFound = true;
-                m.appendReplacement(sb, m.group()); // keep first as-is
-            } else {
-                // Replace "export default function/class " with just "function/class "
-                String replacement = m.group().replaceFirst("export\\s+default\\s+", "");
-                m.appendReplacement(sb, Matcher.quoteReplacement(replacement));
-            }
-        }
-        m.appendTail(sb);
-        return sb.toString();
-    }
 
     public List<GeneratedFile> repairAll(List<GeneratedFile> files, String framework) {
         return files.stream()
@@ -206,7 +175,7 @@ public class BuildValidator {
             }
             default -> issues.add("Unknown framework: " + framework);
         }
-
+        issues.addAll(validateInvalidTailwindClasses(files));
         issues.addAll(validateTailwindWiring(files, framework, deps, devDeps));
         issues.addAll(validateImportsVsDeps(files, deps, devDeps));
         issues.addAll(validateNoPlainCssClassNames(files));
@@ -780,49 +749,6 @@ public class BuildValidator {
      * remove only the duplicate declaration block (from "function Name" to its
      * closing brace), not individual lines.
      */
-    String fixDuplicateComponentDeclaration(String content) {
-        if (content == null) return content;
-
-        Pattern pattern = Pattern.compile("(?m)^(?:export\\s+default\\s+|export\\s+)?function\\s+(\\w+)\\s*\\(");
-        Matcher matcher = pattern.matcher(content);
-
-        Map<String, Integer> countMap = new HashMap<>();
-        while (matcher.find()) {
-            String name = matcher.group(1);
-            countMap.put(name, countMap.getOrDefault(name, 0) + 1);
-        }
-
-        // Process one duplicate at a time (the most common case is exactly one duplicate)
-        for (Map.Entry<String, Integer> entry : countMap.entrySet()) {
-            if (entry.getValue() <= 1) continue;
-
-            String name = entry.getKey();
-            log.warn("[BuildValidator] Duplicate component detected: {}", name);
-
-            // Find positions of all occurrences
-            Pattern funcPattern = Pattern.compile(
-                    "(?m)^(?:export\\s+default\\s+|export\\s+)?function\\s+" + Pattern.quote(name) + "\\s*\\(");
-            Matcher fm = funcPattern.matcher(content);
-
-            List<Integer> starts = new ArrayList<>();
-            while (fm.find()) starts.add(fm.start());
-
-            if (starts.size() < 2) continue;
-
-            // Remove duplicates from the last occurrence backwards to preserve string indices
-            for (int i = starts.size() - 1; i >= 1; i--) {
-                int blockStart = starts.get(i);
-                int blockEnd = findFunctionEnd(content, blockStart);
-                if (blockEnd > blockStart) {
-                    content = content.substring(0, blockStart) + content.substring(blockEnd);
-                }
-            }
-
-            return content; // process one name per pass; caller can re-invoke if needed
-        }
-
-        return content;
-    }
 
     /**
      * Find the closing brace of the function starting at startPos by counting
@@ -876,7 +802,27 @@ public class BuildValidator {
 
         return issues;
     }
+    private List<String> validateInvalidTailwindClasses(List<GeneratedFile> files) {
+        List<String> issues = new ArrayList<>();
 
+        for (GeneratedFile file : files) {
+            if (!file.getPath().endsWith(".css")) continue;
+
+            String content = file.getContent();
+            if (content == null) continue;
+
+            if (content.contains("border-border")
+                    || content.contains("bg-background")
+                    || content.contains("text-foreground")
+                    || content.contains("@apply border-border")
+                    || content.contains("@apply bg-background")
+                    || content.contains("@apply text-foreground")) {
+
+                issues.add("INVALID_TAILWIND_CLASS: " + file.getPath());
+            }
+        }
+        return issues;
+    }
     /**
      * BUG 11 FIX — validate() never checked if App.jsx accidentally imported
      * BrowserRouter or Router. The prompt said not to, but the validator didn't

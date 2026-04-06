@@ -51,40 +51,36 @@ public class DiffAwarePromptBuilder {
     private String buildFullDiffPrompt(
             String filePath, String userRequest, String framework, String currentContent
     ) {
-        // Cap at 6000 chars to avoid context length errors
         String capped = currentContent.length() > 6000
                 ? currentContent.substring(0, 6000) + "\n// ... truncated"
                 : currentContent;
 
         return """
-                You are modifying an EXISTING file. Make ONLY the specific change requested.
-                Do NOT rewrite or restructure anything that isn't directly related to the request.
-                Preserve all existing imports, logic, styling, and functionality.
+            You are modifying an EXISTING file. Make ONLY the specific change requested.
+            Do NOT rewrite unrelated logic, layout, or structure.
 
-                FRAMEWORK: %s
-                FILE: %s
+            FRAMEWORK: %s
+            FILE: %s
 
-                ══════════════════════════════════════════
-                CURRENT VERSION (preserve everything here unless changing it):
-                ══════════════════════════════════════════
-                %s
+            IMPORTANT STYLE RULES:
+            - If the request is app-wide, global, theme-related, or background-related,
+              prefer changing shared CSS variables, body styles, :root values,
+              global utility wrappers, or top-level layout classes.
+            - Do NOT hardcode page-specific background changes unless the request is clearly local.
+            - Preserve imports, routing, and existing component logic.
 
-                ══════════════════════════════════════════
-                USER REQUEST (make only this change):
-                ══════════════════════════════════════════
-                %s
+            CURRENT VERSION:
+            %s
 
-                RULES:
-                - Keep all existing imports
-                - Keep all existing components and functions
-                - Keep all existing Tailwind classes
-                - Only add/modify/remove what the request specifically asks for
-                - Return the COMPLETE modified file (not just the changed section)
-                - Export default must remain on the main component
+            USER REQUEST:
+            %s
 
-                Return ONLY valid JSON:
-                { "path": "%s", "content": "complete modified file content" }
-                """.formatted(framework, filePath, capped, userRequest, filePath);
+            RETURN RULES:
+            - Return the COMPLETE modified file
+            - Keep all unrelated code intact
+            - Return ONLY valid JSON:
+              { "path": "%s", "content": "complete modified file content" }
+            """.formatted(framework, filePath, capped, userRequest, filePath);
     }
 
     private String buildPartialPrompt(

@@ -299,4 +299,22 @@ public class EmbeddingService {
     }
 
     public record SimilarFile(String filePath, Double score) {}
+    public String detectFramework(String projectId) {
+        Map<String, String> files = loadAllFileContents(projectId);
+
+        if (files.containsKey("next.config.js")) {
+            if (files.keySet().stream().anyMatch(p -> p.startsWith("app/"))) {
+                return "next-app";
+            }
+            return "next-pages";
+        }
+
+        if (files.containsKey("angular.json")) return "angular";
+
+        if (files.keySet().stream().anyMatch(p -> p.endsWith(".vue"))) return "vue";
+
+        if (files.containsKey("vite.config.js")) return "react-vite";
+
+        return "react";
+    }
 }

@@ -192,9 +192,9 @@ public class ProjectService {
                 .findById(projectId)
                 .orElseThrow();
 
-        if ("unknown".equals(project.getFramework())) {
-            throw new RuntimeException("Project is still initializing. Try again.");
-        }
+//        if ("unknown".equals(project.getFramework())) {
+//            throw new RuntimeException("Project is still initializing. Try again.");
+//        }
 
         project.setStatus("PROCESSING");
         project.setUpdatedAt(LocalDateTime.now());
