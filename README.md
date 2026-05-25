@@ -420,12 +420,6 @@ Feel free to fork the repository and open a PR 🚀
 
 ---
 
-# 📜 License
-
-MIT License
-
----
-
 # ⭐ Support
 
 If you found this project useful, consider giving it a star ⭐
